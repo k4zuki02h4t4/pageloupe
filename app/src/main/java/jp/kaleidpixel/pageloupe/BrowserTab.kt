@@ -36,7 +36,7 @@ class BrowserTab(
      * saved state, the gated debug log redacts its URLs/hosts
      * during DevTools sessions (the exported console/request logs
      * are NOT redacted — plaintext exports are an accepted
-     * trade-off, recorded in REVIEW.md), and Autofill is told
+     * trade-off, recorded in the design records), and Autofill is told
      * not to save from it.
      *
      * Where the device's WebView supports androidx.webkit
@@ -51,7 +51,7 @@ class BrowserTab(
      * successful delete (see SecretProfile's docs). Where
      * multi-profile is unsupported, that data remains shared with
      * normal tabs; that residual is the accepted limitation
-     * recorded in REVIEW.md.
+     * recorded in the design records.
      *
      * WebSettings.saveFormData is a no-op on API 26+, so it is not
      * part of the protection either way.
@@ -252,7 +252,7 @@ class BrowserTab(
      * with the opener's own privileges — the probe has no
      * powers of its own — but it can put no UI on screen
      * (SEN-314, SEC-152). A pending probe expires on the
-     * events listed in REVIEW.md (the opener's next
+     * events listed in the design records (the opener's next
      * main-frame navigation, a tab switch, the app stopping,
      * an overlay opening, the address bar taking focus, this
      * tab showing a dialog, tab destruction — SEN-309).
@@ -392,6 +392,23 @@ class BrowserTab(
      * gate must judge from.
      */
     var lastCommittedUrl: String = ""
+
+    /**
+     * The committed URL before [lastCommittedUrl] (review
+     * round 4, SEN-1): read by the JS-dialog flood decision
+     * at commit time, when lastCommittedUrl already names
+     * the new document. Empty until the second commit.
+     */
+    var previousCommittedUrl: String = ""
+        private set
+
+    /**
+     * Whether the in-flight load was initiated by the user
+     * (the userNav handed to the listener at onPageStarted):
+     * read by the JS-dialog flood decision at commit time.
+     */
+    var lastLoadUserNav: Boolean = false
+        private set
 
     /**
      * True when a title has arrived since the last committed
@@ -577,6 +594,9 @@ class BrowserTab(
      * at each commit into [lastCommitWasErrorPage].
      */
     private val errorPageTracker = ErrorPageTracker()
+
+    /** This tab's JS-dialog flood state (SEN-386). */
+    val jsDialogFlood = JsDialogFloodPolicy()
 
     /**
      * Whether the last commit was an error page (its load
@@ -787,6 +807,12 @@ class BrowserTab(
             " PageLoupe/" + appVersion
 
     init {
+        // Scrolling changes what a thumbnail would show
+        // (PER-10): mark it stale instead of recapturing on
+        // every tab switch.
+        webView.setOnScrollChangeListener { _, _, scrollY, _, oldScrollY ->
+            if (scrollY != oldScrollY) thumbnailDirty = true
+        }
         val s = webView.settings
         s.javaScriptEnabled = true
         s.domStorageEnabled = true
@@ -901,6 +927,7 @@ class BrowserTab(
                 loadStartedSinceCommit = true
                 val userNav = userNavArmed
                 userNavArmed = false
+                lastLoadUserNav = userNav
                 listener.onPageStarted(this@BrowserTab, userNav)
                 listener.onUrlChanged(this@BrowserTab)
             }
@@ -926,7 +953,9 @@ class BrowserTab(
                 // the page's identity: the tracker records
                 // main-frame calls only, and the filter is
                 // enforced there, not here.
-                errorPageTracker.recordError(request.url?.toString(), request.isForMainFrame)
+                errorPageTracker.recordError(
+                    request.url?.toString(), request.isForMainFrame, error.errorCode
+                )
                 if (request.isForMainFrame) {
                     DebugLog.log("nav", "main-frame load failed")
                 }
@@ -996,6 +1025,7 @@ class BrowserTab(
                     lastCommitWasErrorPage = false
                     return
                 }
+                previousCommittedUrl = lastCommittedUrl
                 lastCommittedUrl = url
                 // An error page commits its failed URL too
                 // (SEN-347): mark exactly that commit, so the
@@ -1065,6 +1095,14 @@ class BrowserTab(
                     if (replacedDocument) fireDocumentReplaced()
                     listener.onPageCommitted(this@BrowserTab, url)
                 } finally {
+                    // The commit consumed the load's user-nav
+                    // mark too (review round 5, SEN-3): the
+                    // flood decision read it during the
+                    // callback above; left standing, it would
+                    // leak into a later same-document commit
+                    // whose load never started (the SEN-222
+                    // shape).
+                    lastLoadUserNav = false
                     // The commit consumed any pending title: it
                     // now belongs to the page just committed.
                     // Both flags clear only here, after the
@@ -1090,6 +1128,12 @@ class BrowserTab(
             override fun onPageFinished(view: WebView, url: String) {
                 DebugLog.log("nav", "page finished")
                 isLoading = false
+                // A finished load is a new visual state
+                // (review round 2, SEN-16): a capture taken
+                // mid-load must not be the last word — the
+                // completed page differs from the spinner or
+                // half-drawn state the switcher may hold.
+                thumbnailDirty = true
                 // The error tracker is deliberately NOT fed
                 // finishes: an error page's finish precedes
                 // its commit (see ErrorPageTracker), so a
@@ -1810,12 +1854,30 @@ class BrowserTab(
     }
 
     /**
+     * Whether the visible page changed since the last
+     * thumbnail capture (PER-10): set by a commit, by
+     * scrolling and by a finished load, cleared by
+     * [captureThumbnail] — and only when the page is not
+     * still loading, so a mid-load capture stays dirty and
+     * is retaken after the finish (review round 2,
+     * SEN-16). Capturing is
+     * a main-thread draw of the whole viewport, so a switch
+     * between two tabs the user merely peeked at should not
+     * pay it again for an unchanged page. Accepted residual:
+     * a page that repaints in place without scrolling or
+     * committing (a live clock, a zoom-only change) can keep
+     * its older thumbnail until the next scroll or commit.
+     */
+    @Volatile var thumbnailDirty: Boolean = true
+
+    /**
      * Snapshot the page into [thumbnail] for the tab switcher card. The full
      * page width is kept and only the top of the viewport is taken, at exactly
      * the card's aspect ratio, so the card never crops the left/right edges.
      * Best effort.
      */
     fun captureThumbnail() {
+        if (!isLoading) thumbnailDirty = false
         try {
             val w = webView.width
             val h = webView.height

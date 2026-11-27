@@ -10,7 +10,7 @@ import jp.kaleidpixel.pageloupe.ExportedLogs
 // MediaStore operations themselves only run on device; this
 // suite pins WHAT they ask for, so an edit cannot silently
 // retarget the pending sweep or the clear-data delete.
-// Run via tests/run_tests.sh.
+// Run via the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0

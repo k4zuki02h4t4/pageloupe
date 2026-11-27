@@ -77,7 +77,16 @@ object DebugLog {
             openFile(ctx)
             log("debug", "debug log enabled")
         } else {
-            synchronized(this) { closeWriterLocked() }
+            // The close runs on the writer queue, not under the
+            // lock on this (UI) thread (review round 3, PER-4):
+            // a writer stuck in a clogged disk write holds the
+            // lock, and waiting for it here would ANR the
+            // settings page. writeLine re-checks `enabled`
+            // under the lock, so lines queued before the close
+            // write nothing once off.
+            dispatcher.enqueueBarrier {
+                synchronized(this) { closeWriterLocked() }
+            }
         }
     }
 
@@ -92,12 +101,18 @@ object DebugLog {
     }
 
     private fun openFile(ctx: Context) {
+        // Resolve the target file only. The writer itself opens
+        // lazily on the writer thread (writeLine), so no file
+        // I/O beyond the directory lookup happens on the
+        // caller's thread (review round 3, PER-4).
         try {
             val dir = logsDir(ctx)
-            synchronized(this) {
-                file = File(dir, "pageloupe-debug.log")
-                openWriterLocked()
-            }
+            // No lock (review round 4, SEN-8): `file` is
+            // @Volatile, and the writer holds this object's
+            // lock across disk writes — taking it here, on
+            // the UI thread, waited out a clogged disk for a
+            // plain assignment.
+            file = File(dir, "pageloupe-debug.log")
         } catch (_: Exception) {
             file = null
         }
@@ -135,7 +150,50 @@ object DebugLog {
      * Logging continues afterwards: the next line reopens
      * a fresh file.
      */
-    fun deleteLogFiles(ctx: Context) {
+    fun deleteLogFiles(ctx: Context): Boolean {
+        // The delete runs as a barrier on the writer queue
+        // (SEN-24): lines already queued are written first
+        // and then deleted with everything else, so a clear
+        // cannot be overtaken by a line that was logged
+        // before it but had not reached the file yet. The
+        // caller waits for the barrier — the clear is a
+        // user-visible privacy action, not a fire-and-forget
+        // — and falls back to doing it inline if the barrier
+        // itself cannot run. The barrier captures the
+        // application context, never the caller's Activity
+        // (review round 3, SEN-10).
+        val appCtx = ctx.applicationContext
+        val done = java.util.concurrent.CountDownLatch(1)
+        try {
+            dispatcher.enqueueBarrier {
+                try {
+                    deleteLogFilesNow(appCtx)
+                } finally {
+                    done.countDown()
+                }
+            }
+            // Bounded (review round 2, SEN-10): the caller
+            // is the UI thread, and an unbounded wait turns
+            // a clogged disk into an ANR. On timeout the
+            // barrier stays queued and still deletes when
+            // it runs — lines queued before it are written
+            // first and deleted with the rest, lines after
+            // it reopen a fresh file. The result is reported
+            // to the caller (review round 3, SEN-10/SEC-5):
+            // false means the delete has NOT happened yet,
+            // and the clear-data flow surfaces that instead
+            // of claiming success.
+            return done.await(2, java.util.concurrent.TimeUnit.SECONDS)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return false
+        } catch (_: Exception) {
+            deleteLogFilesNow(appCtx)
+            return true
+        }
+    }
+
+    private fun deleteLogFilesNow(ctx: Context) {
         synchronized(this) {
             closeWriterLocked()
             try {
@@ -198,6 +256,29 @@ object DebugLog {
             .replace("\u2028", "\\u2028")
             .replace("\u2029", "\\u2029")
 
+    /** Cap on queued, unwritten log lines (SEN-11). */
+    private val MAX_QUEUED_LINES = 1000
+
+    /**
+     * The one writer queue (SEN-24): file writes — with
+     * their rotation and dropped-line notices — run here,
+     * not on the caller's thread, so a log call on the UI or
+     * a relay thread never waits on the disk. Lines keep
+     * their call order (single thread, FIFO) and their
+     * call-time stamps (the line is built before the hand-off).
+     * Daemon and never shut down, like the other process
+     * executors.
+     *
+     * The queue is a real ThreadPoolExecutor held directly
+     * (review round 3, SEN-1): the round-2 cap check cast
+     * the Executors.newSingleThreadExecutor result — a
+     * delegating wrapper, never a ThreadPoolExecutor — so
+     * the cast always failed and the cap never engaged.
+     * [LogLineDispatcher] owns the executor so the cap is
+     * exercisable from JVM tests.
+     */
+    private val dispatcher = LogLineDispatcher(MAX_QUEUED_LINES)
+
     private fun logLine(tag: String, msg: String) {
         if (!enabled) return
         val secret = maskedSecret
@@ -208,6 +289,22 @@ object DebugLog {
         // not forge extra lines in the log file.
         val oneLine = escapeLine(safe)
         val line = "${stamp()} [$tag] $oneLine\n"
+        // Bounded queue (review round 2, SEN-11): the
+        // executor's queue is unbounded, and a clogged disk
+        // would otherwise accumulate a closure and two
+        // strings per log call without limit. Past the cap
+        // the line is dropped and counted like any other
+        // failed log call, so the loss stays visible.
+        if (!dispatcher.offerLine { writeLine(tag, oneLine, line) }) {
+            val report = droppedLines.recordFailureForReport()
+            if (report > 0) {
+                Log.w("PageLoupe/debuglog", "log call dropped (total $report)")
+            }
+            return
+        }
+    }
+
+    private fun writeLine(tag: String, oneLine: String, line: String) {
         synchronized(this) {
             // Re-checked under the lock: a thread that passed the
             // outer check just before setEnabled(false) closed the
@@ -330,3 +427,39 @@ class DroppedLineCounter {
 /** The dropped-calls notice text (without stamp or newline). */
 fun droppedLinesNotice(dropped: Int): String =
     "$dropped earlier log call(s) failed inside the logger and were dropped"
+
+/**
+ * The debug log's single-thread dispatch queue (pure JVM, so
+ * the cap is unit-testable). A real ThreadPoolExecutor is held
+ * directly — never the delegating wrapper that
+ * Executors.newSingleThreadExecutor returns, whose queue the
+ * round-2 cap check could not see (review round 3, SEN-1).
+ * Log lines are subject to the queue cap; barriers (writer
+ * close, log-file deletion) always enqueue, because a clear
+ * must not become impossible exactly when the disk is
+ * clogged. The check-then-enqueue race can overshoot the cap
+ * by at most the number of threads logging concurrently,
+ * which is the soft cap's accepted margin.
+ */
+class LogLineDispatcher(private val maxQueuedLines: Int) {
+
+    private val executor = java.util.concurrent.ThreadPoolExecutor(
+        1, 1, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
+        java.util.concurrent.LinkedBlockingQueue<Runnable>(),
+    ) { r -> Thread(r, "pl-debug-log").apply { isDaemon = true } }
+
+    /** Enqueue a log line; false when the queue is at the cap. */
+    fun offerLine(task: Runnable): Boolean {
+        if (executor.queue.size >= maxQueuedLines) return false
+        executor.execute(task)
+        return true
+    }
+
+    /** Enqueue a barrier task; barriers are never capped. */
+    fun enqueueBarrier(task: Runnable) {
+        executor.execute(task)
+    }
+
+    /** Queued, not-yet-running tasks (test visibility). */
+    fun queuedCount(): Int = executor.queue.size
+}

@@ -1,10 +1,12 @@
+package tests
+
 import jp.kaleidpixel.pageloupe.WsMessageTap
 import java.io.ByteArrayOutputStream
 import java.util.zip.Deflater
 
 /**
  * JVM unit tests for WsMessageTap (the WebSocket observation tap in
- * DevToolsProxy.kt). Run with tests/run_tests.sh. The fixtures are
+ * WsMessageTap.kt). Run via the runUnitTests Gradle task. The fixtures are
  * built here: plain frames in every length encoding, fragmentation,
  * masking, and permessage-deflate with context takeover produced by
  * one shared Deflater, mirroring what Chromium sends.
@@ -432,6 +434,31 @@ fun main() {
         feedAll(textFrame("after-clear"))
         check("message after mid-feed clear delivered",
             messages == listOf("pre-clear", "after-clear"), "$messages")
+    }
+
+    // --- Method filter (PER-5): only wanted methods are
+    // delivered; filtered messages are not counted dropped.
+    run {
+        val got = mutableListOf<String>()
+        val tap = WsMessageTap(setOf("Log.entryAdded")) { got.add(it) }
+        val wanted = """{"method":"Log.entryAdded","params":{}}"""
+        val unwanted = """{"method":"Page.screencastFrame","params":{"data":"AAAA"}}"""
+        val response = """{"id":7,"result":{}}"""
+        val request = """{"id":9,"method":"Log.entryAdded","params":{}}"""
+        tap.feed(textFrame(wanted), 0, textFrame(wanted).size)
+        val u = textFrame(unwanted); tap.feed(u, 0, u.size)
+        val r = textFrame(response); tap.feed(r, 0, r.size)
+        val q = textFrame(request); tap.feed(q, 0, q.size)
+        check("filter delivers wanted event", got.contains(wanted), "$got")
+        check("filter delivers request-shaped wanted method",
+            got.contains(request), "$got")
+        check("filter skips unwanted method", !got.contains(unwanted), "$got")
+        check("filter skips methodless response", !got.contains(response), "$got")
+        check("filtered messages are not drops", tap.droppedMessages == 0,
+            "${tap.droppedMessages}")
+        check("filtered messages are counted apart (PER-6)",
+            tap.filteredMessages == 2, "${tap.filteredMessages}")
+        tap.close()
     }
 
     println("---")

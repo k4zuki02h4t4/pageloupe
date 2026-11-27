@@ -10,7 +10,7 @@ import jp.kaleidpixel.pageloupe.ShareText
 // tab's title does not belong to the URL being shared (a load
 // in flight still shows the previous page's title). The Intent
 // wiring is covered on device.
-// Run via tests/run_tests.sh.
+// Run via the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0

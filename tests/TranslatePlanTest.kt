@@ -7,7 +7,7 @@ import jp.kaleidpixel.pageloupe.TranslatePlan
 // detection sample and the work caps. The ML Kit calls and
 // the in-page scripts are device-verified; what is decided
 // before and after them is pinned here.
-// Run via tests/run_tests.sh.
+// Run via the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0
@@ -209,8 +209,35 @@ fun main() {
     )
     val heavy = TranslatePlan.buildWork(listOf("x".repeat(TranslatePlan.MAX_CHARS + 1)), "")
     check(
-        "a single node past the char cap truncates to nothing",
-        heavy.items.isEmpty() && heavy.truncated
+        "a single node past the per-item cap is cut to the cap, not dropped (SEN-388)",
+        heavy.items.size == 1 &&
+            heavy.items[0].split.core.length == TranslatePlan.MAX_ITEM_CHARS &&
+            heavy.truncated
+    )
+    check(
+        "the per-item cut keeps lead + core + trail equal to the original",
+        heavy.items[0].split.let {
+            it.lead + it.core + it.trail == "x".repeat(TranslatePlan.MAX_CHARS + 1)
+        }
+    )
+    val bigTitle = TranslatePlan.buildWork(
+        listOf("Hello"),
+        "This is a sentence for testing. ".repeat(9_000)
+    )
+    check(
+        "an oversized title is capped per item as well (SEN-388)",
+        bigTitle.items.last().nodeIndex == TranslatePlan.TITLE_INDEX &&
+            bigTitle.items.last().split.core.length == TranslatePlan.MAX_ITEM_CHARS &&
+            bigTitle.truncated
+    )
+    val pairAtCut = "a".repeat(TranslatePlan.MAX_ITEM_CHARS - 1) + "😀" + "b".repeat(100)
+    val pairWork = TranslatePlan.buildWork(listOf(pairAtCut), "")
+    check(
+        "the per-item cut never splits a surrogate pair",
+        pairWork.items.size == 1 &&
+            pairWork.items[0].split.core.length == TranslatePlan.MAX_ITEM_CHARS - 1 &&
+            (pairWork.items[0].split.lead + pairWork.items[0].split.core +
+                pairWork.items[0].split.trail) == pairAtCut
     )
     check(
         "the script's own cap flag marks the work truncated",

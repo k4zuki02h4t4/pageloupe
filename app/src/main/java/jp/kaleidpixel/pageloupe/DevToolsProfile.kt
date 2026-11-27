@@ -31,7 +31,7 @@ import androidx.webkit.WebViewCompat
  * deleted and never wiped, and the state it keeps is the
  * DevTools' own, console history of inspected pages included
  * — the same trade desktop Chrome makes, and an accepted one
- * (recorded in REVIEW.md).
+ * (recorded in the design records).
  *
  * On WebViews without multi-profile support the frontend stays
  * on the default profile and the settings are wiped with

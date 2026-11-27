@@ -12,7 +12,7 @@ import jp.kaleidpixel.pageloupe.normalizeBookmarkUrl
 // moves, reparenting deletes), ordering, search, counts and
 // flattening, URL normalization, and the tolerant JSON round
 // trip (including parents that appear after their children
-// in the file, and cycles). Run via tests/run_tests.sh.
+// in the file, and cycles). Run via the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0
@@ -367,6 +367,31 @@ fun main() {
     added(s3.addBookmark("t", "https://t.example/", root, 1L, false))
     s3.clear()
     check("clear empties", s3.isEmpty() && s3.findByUrl("https://t.example/") == null)
+
+    // parseDocument draws the SEN-2 line, as in HistoryStore:
+    // root corruption is null, row damage is not.
+    val docStore = BookmarkStore()
+    added(docStore.addBookmark("t", "https://t.example/", root, 1L, false))
+    check(
+        "parseDocument accepts a written document",
+        BookmarkStore.parseDocument(docStore.toJson())?.bookmarkCount == 1
+    )
+    check(
+        "parseDocument rejects garbage",
+        BookmarkStore.parseDocument("not json") == null
+    )
+    check(
+        "parseDocument rejects a foreign version",
+        BookmarkStore.parseDocument("""{"v":99,"bookmarks":[]}""") == null
+    )
+    check(
+        "parseDocument rejects a missing bookmarks array",
+        BookmarkStore.parseDocument("""{"v":1}""") == null
+    )
+    check(
+        "fromJson still degrades root corruption to empty",
+        BookmarkStore.fromJson("not json").isEmpty()
+    )
 
     if (failures > 0) {
         println("BookmarkStoreTest: $failures of $checks checks FAILED")

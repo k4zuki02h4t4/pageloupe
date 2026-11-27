@@ -1,3 +1,4 @@
+import java.security.MessageDigest
 import java.time.Duration
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
@@ -5,6 +6,14 @@ import java.util.concurrent.atomic.AtomicReference
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+}
+
+// Pin the JDK the Kotlin compiler runs on (SEN-12): the
+// build was verified on JDK 17, and an ambient JDK of a
+// different version must fail loudly here rather than
+// produce a differently-built artifact.
+kotlin {
+    jvmToolchain(17)
 }
 
 // The org.json version for the test-only jar, named in exactly
@@ -21,8 +30,8 @@ android {
         applicationId = "jp.kaleidpixel.pageloupe"
         minSdk = 33
         targetSdk = 34
-        versionCode = 114
-        versionName = "0.44.1"
+        versionCode = 115
+        versionName = "0.44.2"
 
         // Only the owner's device ABI ships (docs/dependencies.md):
         // the ML Kit AARs carry four ABIs of native engines, and the
@@ -407,6 +416,19 @@ androidComponents {
     }
 }
 
+// AGP's JUnit unit-test tasks (testDebugUnitTest and
+// friends) find no JUnit tests in this project — the suites
+// are main() runners, wired below as runUnitTests — and
+// would report success for having run nothing: a fake green
+// (SEN-3). Disable every JVM Test task by type, so an AGP
+// rename cannot quietly restore one; `check` runs the real
+// suites through runUnitTests, which is already its
+// dependency. (The unitTest SOURCE SET stays: the suites
+// compile and run from it. Only the JUnit task is off.)
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    enabled = false
+}
+
 dependencies {
     // The only two owner-approved dependency exceptions, plus the
     // ML Kit language-id entry point (docs/dependencies.md records
@@ -533,7 +555,7 @@ configurations.all {
 //     fails with NoClassDefFoundError instead of being masked by
 //     a stub. (One recorded difference: the library jars are on
 //     every suite's classpath now; the manual harness compiled
-//     the pure classes alone. See REVIEW.md.)
+//     the pure classes alone. See the design records.)
 //   - the org.json suites additionally get the real org.json jar
 //     FIRST on the classpath (ahead of android.jar's stubs) and
 //     the pageloupe.test.jsonJar property naming the jar they
@@ -561,10 +583,11 @@ data class UnitTestSuite(
 // (task suffix, main class, needs the real org.json first,
 // ran against the real android.jar in the manual harness)
 val unitTestSuites = listOf(
-    UnitTestSuite("WsMessageTap", "WsMessageTapTestKt", false, false),
+    UnitTestSuite("WsMessageTap", "tests.WsMessageTapTestKt", false, false),
     UnitTestSuite("UrlInput", "tests.UrlInputTestKt", false, false),
     UnitTestSuite("TargetSearch", "tests.TargetSearchTestKt", false, false),
     UnitTestSuite("DebugLogCounter", "tests.DebugLogCounterTestKt", false, false),
+    UnitTestSuite("DebugLogQueue", "tests.DebugLogQueueTestKt", false, false),
     UnitTestSuite("RecorderText", "tests.RecorderTextTestKt", false, true),
     UnitTestSuite("SecretProfilePolicy", "tests.SecretProfilePolicyTestKt", false, false),
     UnitTestSuite("ProfileNames", "tests.ProfileNamesTestKt", false, false),
@@ -602,6 +625,10 @@ val unitTestSuites = listOf(
     UnitTestSuite("BookmarkStore", "tests.BookmarkStoreTestKt", true, true),
     UnitTestSuite("FaviconStore", "tests.FaviconStoreTestKt", false, true),
     UnitTestSuite("DevToolsProxyPolicy", "tests.DevToolsProxyPolicyTestKt", false, false),
+    UnitTestSuite("JsDialogFloodPolicy", "tests.JsDialogFloodPolicyTestKt", false, false),
+    UnitTestSuite("DevToolsProxyGate", "tests.DevToolsProxyGateTestKt", false, false),
+    UnitTestSuite("ExportController", "tests.ExportControllerTestKt", false, false),
+    UnitTestSuite("TranslateScriptContract", "tests.TranslateScriptContractTestKt", false, false),
 )
 
 // The suite list above is hand-maintained; this guard keeps it
@@ -686,8 +713,8 @@ val verifyUnitTestSuiteList = tasks.register("verifyUnitTestSuiteList") {
 
 // AGP lint is disabled wholesale: the manual pipeline ran no
 // lint, and this project's static review is the Claude Code
-// review loop recorded in REVIEW.md, whose findings register
-// is review/FINDINGS.md. AGP's default lint ruleset was never
+// review loop recorded in the design records (kept with
+// them, not published). AGP's default lint ruleset was never
 // adopted, and its pre-existing findings would otherwise gate
 // `check` and slow every assemble (lintVital). Re-enabling lint
 // is a deliberate future decision, not a migration side effect.
@@ -732,9 +759,69 @@ val verifyManifestSelfTest = tasks.register<Exec>("verifyManifestSelfTest") {
     timeout.set(Duration.ofMinutes(2))
     commandLine("python3", "-I", file("verify_manifest_test.py"))
 }
+
+// The backup / device-transfer exclusion gate (SEN-5): the
+// two sections of data_extraction_rules.xml must stay
+// identical and must cover every state file in its plain,
+// .tmp and .corrupt forms, with the names derived from the
+// Kotlin sources. The source XML is what aapt compiles for
+// this resource (no merger touches res/xml), so gating the
+// source gates the shipped rules. Its self-test runs beside
+// it, like the manifest verifier's.
+val verifyBackupRules = tasks.register<Exec>("verifyBackupRules") {
+    outputs.upToDateWhen { false }
+    timeout.set(Duration.ofMinutes(2))
+    commandLine(
+        "python3", "-I", file("verify_backup_rules.py"),
+        file("src/main/res/xml/data_extraction_rules.xml"),
+        file("src/main/java/jp/kaleidpixel/pageloupe/MainActivity.kt"),
+        file("src/main/java/jp/kaleidpixel/pageloupe/Settings.kt"),
+        file("src/main/java/jp/kaleidpixel/pageloupe/AtomicFileWrite.kt"),
+    )
+}
+val verifyBackupRulesSelfTest = tasks.register<Exec>("verifyBackupRulesSelfTest") {
+    outputs.upToDateWhen { false }
+    timeout.set(Duration.ofMinutes(2))
+    commandLine("python3", "-I", file("verify_backup_rules.py"), "--selftest")
+}
 tasks.configureEach {
     if (name == "check") {
         dependsOn(verifyManifestSelfTest)
+        dependsOn(verifyBackupRules)
+        dependsOn(verifyBackupRulesSelfTest)
+    }
+}
+
+// The Gradle wrapper jar is the one build input that the
+// dependency verification cannot cover: it is what starts
+// the build. Pin its SHA-256 (SEN-11), recorded from the
+// jar the wrapper was generated with (and recorded in
+// docs/dependencies.md); a swapped jar fails check before
+// anything ships from it. Regenerating the wrapper means
+// updating the pin deliberately, in the open.
+val verifyGradleWrapperJar = tasks.register("verifyGradleWrapperJar") {
+    group = "verification"
+    description = "Asserts gradle-wrapper.jar matches its pinned SHA-256."
+    outputs.upToDateWhen { false }
+    val jarFile = rootProject.file("gradle/wrapper/gradle-wrapper.jar")
+    inputs.file(jarFile)
+    doLast {
+        val expected =
+            "2db75c40782f5e8ba1fc278a5574bab070adccb2d21ca5a6e5ed840888448046"
+        val digest = MessageDigest.getInstance("SHA-256")
+        val actual = digest.digest(jarFile.readBytes())
+            .joinToString("") { b -> "%02x".format(b) }
+        if (actual != expected) {
+            throw GradleException(
+                "gradle-wrapper.jar SHA-256 is $actual, expected" +
+                    " $expected (app/build.gradle.kts SEN-11 pin)",
+            )
+        }
+    }
+}
+tasks.configureEach {
+    if (name == "check") {
+        dependsOn(verifyGradleWrapperJar)
     }
 }
 

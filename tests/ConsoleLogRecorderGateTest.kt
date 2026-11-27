@@ -10,7 +10,7 @@ import org.json.JSONObject
 // while the tab shows the start page (a leaving page's tail, an
 // entering page's head). Runs against the pinned test-only
 // JSON-java jar like RecorderJsonTest; run via
-// tests/run_tests.sh.
+// the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0
@@ -68,7 +68,7 @@ fun main() {
     run {
         val expected = System.getProperty("pageloupe.test.jsonJar")
         if (expected.isNullOrEmpty()) {
-            println("ConsoleLogRecorderGate: run via tests/run_tests.sh (it passes the pinned jar name) — aborting")
+            println("ConsoleLogRecorderGate: run via the runUnitTests Gradle task (it passes the pinned jar name) — aborting")
             kotlin.system.exitProcess(1)
         }
         val loc = JSONObject::class.java.protectionDomain

@@ -7,7 +7,7 @@ import jp.kaleidpixel.pageloupe.PanelHeight
 // rotation clamp, and the applied cap that keeps the bottom
 // toolbar inside the column when the IME shrinks it. Pure
 // arithmetic; the layout wiring is covered on device.
-// Run via tests/run_tests.sh.
+// Run via the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0

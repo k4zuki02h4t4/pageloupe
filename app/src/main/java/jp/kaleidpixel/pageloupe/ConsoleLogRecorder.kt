@@ -236,7 +236,31 @@ class ConsoleLogRecorder {
         // Lazy: only the three entry-producing branches use it --
         // serializing for every Network event (the bulk of the
         // traffic) would be the same waste at any size.
-        fun rawOf(): String? = if (rawLength <= MAX_RAW_CHARS) obj.toString() else null
+        fun rawOf(): String? = if (rawLength <= MAX_RAW_CHARS) {
+            // The raw event quotes the same URLs the
+            // structured fields redact (review round 3,
+            // SEC-1), so the raw copy must not keep what
+            // the fields withheld. The redaction runs on
+            // the PARSED values, not the serialization
+            // (review round 5, SEN-1/SEC-1): serializers
+            // escape differently (the device org.json
+            // writes "\/" for "/"), which broke every
+            // pattern that assumed a plain "://" in the
+            // serialized text. In memory the strings are
+            // unescaped on both platforms, so a deep copy
+            // with each string run through the text
+            // redactor is serializer-proof.
+            try {
+                redactDeep(obj).toString()
+            } catch (_: Error) {
+                // A pathological nest must not take the
+                // relay down with the raw copy (round 6,
+                // SEN-5): no raw is the fail-closed answer.
+                null
+            }
+        } else {
+            null
+        }
         when (method) {
             "Log.entryAdded" -> {
                 val e = obj.optJSONObject("params")?.optJSONObject("entry") ?: return
@@ -246,9 +270,9 @@ class ConsoleLogRecorder {
                     Entry(
                         timeMs = normalizeTs(e.optDouble("timestamp", Double.NaN)),
                         level = e.optString("level", "log"),
-                        text = e.optString("text"),
+                        text = redactSecretsInText(e.optString("text")),
                         source = e.optString("source").ifEmpty { null },
-                        url = e.optString("url").ifEmpty { null } ?: top?.url,
+                        url = capUrl(e.optString("url").ifEmpty { null }) ?: top?.url,
                         line = if (e.has("lineNumber")) e.optInt("lineNumber") + 1 else top?.line,
                         column = top?.column,
                         scriptId = top?.scriptId,
@@ -285,9 +309,15 @@ class ConsoleLogRecorder {
                     nr.startMonoSec = mono
                     val req = p.optJSONObject("request")
                     nr.method = capText(req?.optString("method")?.ifEmpty { null })
-                    nr.url = capText(req?.optString("url")?.ifEmpty { null })
-                    nr.requestHeaders = capField(req?.optJSONObject("headers")?.toString())
-                    nr.postData = capText(req?.optString("postData")?.ifEmpty { null })
+                    nr.url = capText(redactUrlQuery(req?.optString("url")?.ifEmpty { null }))
+                    nr.requestHeaders =
+                        capField(redactHeaders(req?.optJSONObject("headers")?.toString()))
+                    nr.postData = capText(
+                        redactPostData(
+                            req?.optString("postData")?.ifEmpty { null },
+                            req?.optJSONObject("headers")
+                        )
+                    )
                     nr.type = capText(p.optString("type").ifEmpty { null })
                     nr.initiator = capText(frameRef(initiatorFrame(p.optJSONObject("initiator"))))
                     netChars += reqCost(nr)
@@ -307,13 +337,15 @@ class ConsoleLogRecorder {
                         capText(resp.optString("statusText").ifEmpty { null }) ?: nr.statusText
                     nr.mimeType =
                         capText(resp.optString("mimeType").ifEmpty { null }) ?: nr.mimeType
-                    nr.url = capText(resp.optString("url").ifEmpty { null }) ?: nr.url
+                    nr.url = capText(redactUrlQuery(resp.optString("url").ifEmpty { null })) ?: nr.url
                     // Replace when a headers object was actually
                     // sent: keeping the previous hop's headers when
                     // the new ones are oversize would misattribute
                     // them.
                     val respHeaders = resp.optJSONObject("headers")
-                    if (respHeaders != null) nr.responseHeaders = capField(respHeaders.toString())
+                    if (respHeaders != null) {
+                        nr.responseHeaders = capField(redactHeaders(respHeaders.toString()))
+                    }
                     nr.type = capText(p.optString("type").ifEmpty { null }) ?: nr.type
                     netChars += reqCost(nr) - before
                     evictNetLocked(nr)
@@ -367,7 +399,7 @@ class ConsoleLogRecorder {
                     Entry(
                         timeMs = normalizeTs(p.optDouble("timestamp", Double.NaN)),
                         level = p.optString("type", "log"),
-                        text = parts.joinToString(" "),
+                        text = redactSecretsInText(parts.joinToString(" ")),
                         source = "console",
                         url = top?.url,
                         line = top?.line,
@@ -389,9 +421,9 @@ class ConsoleLogRecorder {
                     Entry(
                         timeMs = System.currentTimeMillis(),
                         level = "error",
-                        text = text,
+                        text = redactSecretsInText(text),
                         source = "javascript",
-                        url = d.optString("url").ifEmpty { null } ?: top?.url,
+                        url = capUrl(d.optString("url").ifEmpty { null }) ?: top?.url,
                         line = if (d.has("lineNumber")) d.optInt("lineNumber") + 1 else top?.line,
                         column = top?.column,
                         scriptId = top?.scriptId,
@@ -484,6 +516,610 @@ class ConsoleLogRecorder {
         else -> HEADERS_OMITTED
     }
 
+    // --- Credential redaction (FULL-SEC-Q1) ---
+    //
+    // The recordings are plain text by design (SEC-127), but
+    // credential VALUES are not diagnostic content: an
+    // Authorization header or a login form's password field
+    // in an exported file is a live secret in a shareable
+    // artifact. Redaction happens at ingestion, so no
+    // consumer — export today, anything tomorrow — can
+    // receive the value. Header NAMES, body structure and
+    // non-sensitive values are untouched: the recording
+    // still shows what kind of request was made. (The
+    // owner's call, recorded in the ledger: if full-fidelity
+    // capture is ever wanted back, this block is the one
+    // place to lift.)
+
+    /** Redact credential header values in a stored headers
+     * JSON string. An unparseable string passes through
+     * unchanged: the export substitutes its invalid marker
+     * for those, so nothing readable leaks that way either. */
+    private fun redactHeaders(raw: String?): String? {
+        if (raw == null) return null
+        val obj = try {
+            JSONObject(raw)
+        } catch (_: Exception) {
+            return raw
+        }
+        var changed = false
+        val keys = obj.keys()
+        while (keys.hasNext()) {
+            val k = keys.next()
+            if (isSensitiveHeader(k)) {
+                obj.put(k, REDACTED_VALUE)
+                changed = true
+            } else if (isPluralCredentialName(k) &&
+                k.lowercase() !in CORS_HEADERS &&
+                !isCounterValue(obj.optString(k))
+            ) {
+                // A compound-plural header with a non-numeric
+                // value is a credential list; a numeric one
+                // is a rate-limit counter (round 6, PER-2:
+                // x-ratelimit-remaining-tokens).
+                obj.put(k, REDACTED_VALUE)
+                changed = true
+            } else if (k.lowercase() in URL_VALUED_HEADERS) {
+                // A URL in a header value (Referer, Location)
+                // carries the same query credentials as a
+                // request URL (review round 4, SEC-6).
+                val v = obj.optString(k)
+                val r = redactUrlQuery(v)
+                if (r != null && r != v) {
+                    obj.put(k, r)
+                    changed = true
+                }
+            }
+        }
+        return if (changed) obj.toString() else raw
+    }
+
+    /** A headers object's one value, case-insensitively. */
+    private fun headerValue(headers: JSONObject?, name: String): String? {
+        if (headers == null) return null
+        val keys = headers.keys()
+        while (keys.hasNext()) {
+            val k = keys.next()
+            if (k.equals(name, ignoreCase = true)) {
+                return headers.optString(k).ifEmpty { null }
+            }
+        }
+        return null
+    }
+
+    /** Redact credential fields in a request body, by its
+     * declared content type: form pairs and JSON keys whose
+     * names are credential-shaped lose their values. Any
+     * other body passes through unchanged — free-form
+     * payloads are the recording's diagnostic content. */
+    private fun redactPostData(postData: String?, headers: JSONObject?): String? {
+        if (postData == null) return null
+        val contentType = headerValue(headers, "Content-Type")
+            ?.lowercase().orEmpty()
+        val trimmed = postData.trimStart()
+        return when {
+            contentType.contains("application/x-www-form-urlencoded") ->
+                redactFormBody(postData)
+            contentType.contains("json") ||
+                trimmed.startsWith("{") || trimmed.startsWith("[") ->
+                // The declared type is not trusted as the
+                // only signal (review round 2, PER-7): a
+                // JSON body sent as text/plain (sendBeacon
+                // and kin) is still JSON, and redacting it
+                // only when the label says so left it raw.
+                redactJsonBody(postData)
+            contentType.contains("multipart/") ->
+                // Multipart bodies are NOT parsed for
+                // redaction: their parts are left as recorded.
+                // Recorded as an accepted residual in the
+                // design records (review round 2, SEN-9).
+                postData
+            isFormShaped(postData) ->
+                // A form-shaped body under a non-form label
+                // (a fetch with a string body is text/plain)
+                // carries the same credentials (review
+                // round 3, SEC-6): the shape decides, not the
+                // declared type. Form redaction only rewrites
+                // credential-named pairs, so innocent pairs
+                // keep their diagnostic value.
+                redactFormBody(postData)
+            else -> postData
+        }
+    }
+
+    /** Redact credential query parameters in a recorded
+     * URL (review round 2, SEN-9): a token in a request
+     * URL's query is the same secret as one in a header.
+     * Only the values of credential-named parameters are
+     * replaced; the URL's shape stays readable. */
+    private fun redactUrlQuery(url: String?): String? {
+        if (url == null) return null
+        var u = url
+        // Userinfo credentials (user:password@host): a
+        // password in plain sight (review round 3, SEN-6
+        // question). Only the password half is replaced.
+        val schemeEnd = u.indexOf("://")
+        if (schemeEnd >= 0) {
+            val authStart = schemeEnd + 3
+            // The authority ends at the first of '/', '?',
+            // '#' (review round 4, SEN-6): a pathless URL
+            // whose query holds ':' and '@' is not userinfo.
+            var authEnd = u.length
+            for (j in authStart until u.length) {
+                val ch = u[j]
+                if (ch == '/' || ch == '?' || ch == '#') {
+                    authEnd = j
+                    break
+                }
+            }
+            if (authEnd > authStart) {
+                val at = u.lastIndexOf('@', authEnd - 1)
+                val colon = u.indexOf(':', authStart)
+                if (at > authStart && colon >= authStart && colon < at) {
+                    u = u.substring(0, colon + 1) + REDACTED_VALUE + u.substring(at)
+                }
+            }
+        }
+        val q = u.indexOf('?')
+        if (q < 0) return redactFragmentPairs(u)
+        val frag = u.indexOf('#', q)
+        val queryEnd = if (frag >= 0) frag else u.length
+        val query = u.substring(q + 1, queryEnd)
+        if (query.isEmpty()) return redactFragmentPairs(u)
+        var changed = false
+        val redacted = query.split('&').joinToString("&") { pair ->
+            val eq = pair.indexOf('=')
+            if (eq <= 0) {
+                pair
+            } else {
+                val key = pair.substring(0, eq)
+                val decoded = try {
+                    java.net.URLDecoder.decode(key, "UTF-8")
+                } catch (_: Exception) {
+                    key
+                }
+                if (isSensitivePairKey(decoded)) {
+                    changed = true
+                    "$key=$REDACTED_VALUE"
+                } else {
+                    pair
+                }
+            }
+        }
+        val withQuery = if (changed) {
+            u.substring(0, q + 1) + redacted + u.substring(queryEnd)
+        } else {
+            u
+        }
+        return redactFragmentPairs(withQuery)
+    }
+
+    /**
+     * OAuth implicit flow puts tokens in the fragment
+     * (…#access_token=…) (review round 3, SEN-6 question):
+     * when the fragment is pair-shaped, redact it like a
+     * query. A plain fragment identifier is left alone.
+     */
+    private fun redactFragmentPairs(url: String): String {
+        val hash = url.indexOf('#')
+        if (hash < 0) return url
+        val frag = url.substring(hash + 1)
+        if (!frag.contains('=')) return url
+        return url.substring(0, hash + 1) + redactFormBody(frag)
+    }
+
+    /**
+     * Redact credentials inside free text (review round 3,
+     * SEC-1/PER-9; round 4, SEN-5/SEC-1): console text and
+     * the raw event JSON quote URLs the structured fields
+     * already redacted, in every form a URL carries a
+     * credential — query pairs, pair-shaped fragments and
+     * userinfo passwords. Runs are escape-aware (round 4):
+     * the device org.json serializer writes '/' as "\/",
+     * so a backslash inside a run is an escape carrier and
+     * is skipped together with the character it escapes,
+     * never a run terminator — otherwise a query value
+     * containing '/' cut the run and left every parameter
+     * after it unredacted in the raw copy.
+     */
+    private fun redactSecretsInText(text: String): String {
+        if (!text.contains('?') && !text.contains('#') &&
+            !text.contains(':')
+        ) {
+            return text
+        }
+        // The userinfo scan only runs when a scheme form
+        // is present (round 6, PER-1): most strings carry
+        // a ':' (times, "key: value") without any URL.
+        val src = if (text.contains("://") || text.contains(":\\/\\/")) {
+            redactUserinfoInText(text)
+        } else {
+            text
+        }
+        val sb = StringBuilder(src.length)
+        var i = 0
+        while (i < src.length) {
+            val c = src[i]
+            if (c != '?' && c != '#') {
+                sb.append(c)
+                i++
+                continue
+            }
+            var end = i + 1
+            while (end < src.length) {
+                val e = src[end]
+                if (e == '\\' && end + 1 < src.length) {
+                    val n = src[end + 1]
+                    // Escaped separators and quotes are part
+                    // of the run; an escaped LINE BREAK ends
+                    // it (review round 5, PER-1) — in the raw
+                    // copy "\n" is how a real newline inside
+                    // the quoted text is written, and a pair
+                    // must not swallow the next line's start.
+                    if (n == 'n' || n == 't' || n == 'r') break
+                    if (n == '/' || n == '"' || n == '\\') {
+                        end += 2
+                        continue
+                    }
+                }
+                if (e.isWhitespace() || e == '"' || e == '\'' ||
+                    e == '<' || e == '>'
+                ) {
+                    break
+                }
+                end++
+            }
+            val run = src.substring(i + 1, end)
+            sb.append(c)
+            if (c == '?') {
+                val hash = run.indexOf('#')
+                val head = if (hash >= 0) run.substring(0, hash) else run
+                sb.append(redactFormBody(head))
+                if (hash >= 0) {
+                    val tail = run.substring(hash + 1)
+                    sb.append('#')
+                    sb.append(
+                        if (tail.contains('=')) redactFormBody(tail) else tail
+                    )
+                }
+            } else {
+                // A '#' with no '?' before it: only a
+                // pair-shaped fragment is touched, so plain
+                // fragments and prose keep their text.
+                sb.append(if (run.contains('=')) redactFormBody(run) else run)
+            }
+            i = end
+        }
+        return sb.toString()
+    }
+
+    /**
+     * A deep copy of a parsed event with every string
+     * value run through the text redactor (round 5): the
+     * raw copy's redaction basis. Non-string values pass
+     * through unchanged.
+     */
+    private fun redactDeep(v: Any?): Any? = when (v) {
+        is JSONObject -> {
+            val copy = JSONObject()
+            val keys = v.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                copy.put(k, redactDeep(v.get(k)))
+            }
+            copy
+        }
+        is JSONArray -> {
+            val copy = JSONArray()
+            for (i in 0 until v.length()) {
+                copy.put(redactDeep(v.get(i)))
+            }
+            copy
+        }
+        is String -> redactSecretsInText(v)
+        else -> v
+    }
+
+    /**
+     * Redact userinfo passwords in URLs quoted in text.
+     * Both scheme forms are recognized (review round 5,
+     * SEN-1/SEC-1): the plain "://" of parsed text and the
+     * ":\\/\\/" the device org.json serializer writes into
+     * the raw copy — round 4 recognized only the plain
+     * form, so the raw copy kept the password.
+     */
+    private fun redactUserinfoInText(text: String): String {
+        if (!text.contains(':')) return text
+        val sb = StringBuilder(text)
+        var searchFrom = 0
+        while (true) {
+            val colon = sb.indexOf(":", searchFrom)
+            if (colon < 0) break
+            val authStart = when {
+                sb.startsWith("//", colon + 1) -> colon + 3
+                sb.startsWith("\\/\\/", colon + 1) -> colon + 5
+                else -> -1
+            }
+            if (authStart < 0) {
+                searchFrom = colon + 1
+                continue
+            }
+            var authEnd = sb.length
+            for (j in authStart until sb.length) {
+                val ch = sb[j]
+                if (ch == '/' || ch == '\\' || ch == '?' ||
+                    ch == '#' || ch.isWhitespace() || ch == '"' ||
+                    ch == '\''
+                ) {
+                    authEnd = j
+                    break
+                }
+            }
+            var at = -1
+            var pwColon = -1
+            for (j in authStart until authEnd) {
+                if (sb[j] == '@') at = j
+                if (sb[j] == ':' && pwColon < 0) pwColon = j
+            }
+            if (at > authStart && pwColon >= authStart && pwColon < at) {
+                sb.replace(pwColon + 1, at, REDACTED_VALUE)
+                searchFrom = pwColon + 1 + REDACTED_VALUE.length + 1
+            } else {
+                searchFrom =
+                    if (authEnd > searchFrom) authEnd else searchFrom + 1
+            }
+        }
+        return sb.toString()
+    }
+
+    /** A URL on its way into a record: capped and redacted
+     * in one place, so no ingestion path can forget the
+     * redaction (review round 3, SEC-1). */
+    private fun capUrl(s: String?): String? = redactUrlQuery(capText(s))
+
+    /**
+     * Whether a body is shaped like form data: every
+     * '&'-separated segment is a key=value pair whose key
+     * carries no whitespace. A single pair qualifies — a
+     * one-field form is still a form.
+     */
+    private fun isFormShaped(body: String): Boolean {
+        if (body.isEmpty()) return false
+        return body.split('&').all { pair ->
+            val eq = pair.indexOf('=')
+            eq > 0 && pair.substring(0, eq).none { it.isWhitespace() }
+        }
+    }
+
+    private fun redactFormBody(body: String): String =
+        body.split('&').joinToString("&") { pair ->
+            val eq = pair.indexOf('=')
+            if (eq <= 0) {
+                pair
+            } else {
+                val key = pair.substring(0, eq)
+                val decoded = try {
+                    java.net.URLDecoder.decode(key, "UTF-8")
+                } catch (_: Exception) {
+                    key
+                }
+                if (isSensitivePairKey(decoded)) {
+                    "$key=$REDACTED_VALUE"
+                } else {
+                    pair
+                }
+            }
+        }
+
+    private fun redactJsonBody(body: String): String {
+        // Trailing whitespace is not trailing content
+        // (review round 4, SEN-7): tokener.more() does not
+        // skip whitespace, so a body ending in a newline —
+        // a common encoder habit — read as "more content"
+        // and the whole body was withheld. Parse the
+        // trimmed text; the verbatim return below still
+        // uses the original.
+        val tokener = org.json.JSONTokener(body.trimEnd())
+        val root = try {
+            tokener.nextValue()
+        } catch (_: Exception) {
+            // Fail closed (review round 2, SEN-8): a JSON
+            // body that does not parse — CDP truncates
+            // postData at its cap, so a cut body is exactly
+            // the case that occurs — was stored raw,
+            // password and all. Withhold the body instead.
+            return REDACTED_UNPARSEABLE
+        } catch (_: Error) {
+            // A pathologically nested body exhausts the
+            // stack inside the recursive parser (review
+            // round 3, PER-8): fail closed the same way
+            // instead of letting the Error reach the relay.
+            return REDACTED_UNPARSEABLE
+        }
+        // nextValue reads ONE value (review round 3, SEN-4):
+        // trailing content — NDJSON batches, concatenated
+        // documents — was never inspected, so a credential
+        // on a later line sailed through, and when the first
+        // value did change, the tail was silently dropped.
+        // Anything past the first value but whitespace makes
+        // the whole body unparseable here.
+        val hasTrailing = try {
+            tokener.more()
+        } catch (_: Exception) {
+            true
+        }
+        if (hasTrailing) return REDACTED_UNPARSEABLE
+        if (root !is JSONObject && root !is JSONArray) return body
+        // Unchanged bodies keep their original text: re-
+        // serializing rewrites number spellings and key
+        // order, which is diagnostic content (SEN-8).
+        val changed = try {
+            redactJsonValue(root)
+        } catch (_: Error) {
+            return REDACTED_UNPARSEABLE
+        }
+        return if (changed) root.toString() else body
+    }
+
+    /** A header value that is a counter, not a
+     * credential: digits and dots, or a duration built
+     * from them ("6m0s", "1.5s", "20ms") — rate-limit
+     * headers use both forms (round 7, SEN-5). */
+    private fun isCounterValue(v: String): Boolean =
+        v.isNotEmpty() && v.any { it.isDigit() } &&
+            v.all { it.isDigit() || it == '.' || it in "msunh" }
+
+    /**
+     * Redact every string in a credential container's
+     * subtree, whatever the inner key names are (round
+     * 7, SEC-1): a plural-named map or list of tokens is
+     * a name-to-secret mapping, and its inner names are
+     * site-chosen ids, not credential names. Non-string
+     * scalars keep their values.
+     */
+    private fun redactCredentialSubtree(v: Any?): Boolean {
+        var changed = false
+        when (v) {
+            is JSONObject -> {
+                val keys = v.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val child = v.get(k)
+                    if (isSensitiveBodyKey(k)) {
+                        // An explicit credential name keeps
+                        // its any-type rule even inside a
+                        // plural container (round 8, PER-1:
+                        // a numeric PIN under "pin").
+                        v.put(k, REDACTED_VALUE)
+                        changed = true
+                    } else if (child is String) {
+                        v.put(k, REDACTED_VALUE)
+                        changed = true
+                    } else if (redactCredentialSubtree(child)) {
+                        changed = true
+                    }
+                }
+            }
+            is JSONArray -> {
+                for (i in 0 until v.length()) {
+                    val el = v.get(i)
+                    if (el is String) {
+                        v.put(i, REDACTED_VALUE)
+                        changed = true
+                    } else if (redactCredentialSubtree(el)) {
+                        changed = true
+                    }
+                }
+            }
+        }
+        return changed
+    }
+
+    /**
+     * For an ambiguous name's array value (round 7,
+     * SEN-3): string elements redact individually,
+     * non-strings keep their values, and object elements
+     * are recursed into by key name as usual.
+     */
+    private fun redactStringElements(arr: JSONArray): Boolean {
+        var changed = false
+        for (i in 0 until arr.length()) {
+            val el = arr.get(i)
+            if (el is String) {
+                arr.put(i, REDACTED_VALUE)
+                changed = true
+            } else if (el is JSONArray) {
+                // A nested array keeps the element rule:
+                // its strings are this name's values too
+                // (round 8, SEN-1).
+                if (redactStringElements(el)) changed = true
+            } else if (redactJsonValue(el)) {
+                changed = true
+            }
+        }
+        return changed
+    }
+
+    /**
+     * The ambiguous-name and compound-plural dispatch
+     * (round 7): returns whether anything changed, and
+     * calls [putWhole] when the member's whole value is
+     * the credential. Numbers, booleans and null never
+     * reach here (the caller keeps them untouched), which
+     * is what preserves usage counts (PER-2/PER-3).
+     */
+    private fun redactAmbiguousOrPlural(
+        k: String,
+        child: Any,
+        putWhole: () -> Unit
+    ): Boolean {
+        if (k.lowercase() in SENSITIVE_EXACT_SCALAR) {
+            return when (child) {
+                is String -> {
+                    putWhole()
+                    true
+                }
+                // String elements redact individually;
+                // objects inside are recursed by name.
+                is JSONArray -> redactStringElements(child)
+                // "auth" the object: recurse by name, as
+                // since round 1.
+                else -> redactJsonValue(child)
+            }
+        }
+        if (isPluralCredentialName(k)) {
+            return when (child) {
+                is String -> {
+                    putWhole()
+                    true
+                }
+                // A name-to-secret mapping or a mixed
+                // list: every string inside is a
+                // credential, whatever its inner name
+                // (round 7, SEC-1).
+                is JSONObject, is JSONArray ->
+                    redactCredentialSubtree(child)
+                else -> false
+            }
+        }
+        return redactJsonValue(child)
+    }
+
+    /** Redact in place; returns whether anything changed. */
+    private fun redactJsonValue(v: Any?): Boolean {
+        var changed = false
+        when (v) {
+            is JSONObject -> {
+                val keys = v.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val child = v.get(k)
+                    if (isSensitiveBodyKey(k)) {
+                        v.put(k, REDACTED_VALUE)
+                        changed = true
+                    } else if (child is JSONObject || child is JSONArray ||
+                        child is String
+                    ) {
+                        if (redactAmbiguousOrPlural(k, child) {
+                                v.put(k, REDACTED_VALUE)
+                            }
+                        ) {
+                            changed = true
+                        }
+                    } else if (redactJsonValue(child)) {
+                        changed = true
+                    }
+                }
+            }
+            is JSONArray -> {
+                for (i in 0 until v.length()) {
+                    if (redactJsonValue(v.get(i))) changed = true
+                }
+            }
+        }
+        return changed
+    }
+
     private fun parseFrames(stackTrace: JSONObject?): List<Frame> {
         val arr = stackTrace?.optJSONArray("callFrames") ?: return emptyList()
         val out = mutableListOf<Frame>()
@@ -495,7 +1131,7 @@ class ConsoleLogRecorder {
             out.add(
                 Frame(
                     functionName = capText(f.optString("functionName").ifEmpty { null }),
-                    url = capText(f.optString("url").ifEmpty { null }),
+                    url = capUrl(f.optString("url").ifEmpty { null }),
                     scriptId = f.optString("scriptId").ifEmpty { null },
                     line = f.optInt("lineNumber", -1).takeIf { it >= 0 }?.plus(1),
                     column = f.optInt("columnNumber", -1).takeIf { it >= 0 }?.plus(1)
@@ -522,7 +1158,7 @@ class ConsoleLogRecorder {
     /** "url:line" style reference for a call frame object (CDP field names). */
     private fun frameRef(f: JSONObject?): String? {
         if (f == null) return null
-        val url = f.optString("url").ifEmpty { null }
+        val url = redactUrlQuery(f.optString("url").ifEmpty { null })
         val scriptId = f.optString("scriptId").ifEmpty { null }
         val base = url ?: scriptId?.let { "script $it" } ?: return null
         val line = f.optInt("lineNumber", -1)
@@ -602,44 +1238,64 @@ class ConsoleLogRecorder {
     // must never read the recorder's live state, because they run
     // on the export thread while the caller may already have
     // cleared the recorder for the next session.
-    fun toJson(list: List<Entry>, net: Map<String, NetReq>): String {
-        val arr = JSONArray()
+
+    /**
+     * Stream the console export into [out] with a JsonWriter,
+     * the same shape as the requests export (PER-9): building
+     * the whole JSONArray tree plus the rendered string first
+     * put a transient heap peak next to the resident store at
+     * the caps, and an OOM there would lose the recording to
+     * the clear() that follows the export. The export format
+     * does not change; the cosmetic properties are the ones
+     * listed on writeRequestsJson. The writer is NOT closed
+     * here: the caller owns [out].
+     */
+    fun writeConsoleJson(list: List<Entry>, net: Map<String, NetReq>, out: java.io.Writer) {
+        val jw = android.util.JsonWriter(out)
+        jw.setIndent("  ")
+        writeConsoleJson(list, net, AndroidJsonSink(jw))
+    }
+
+    internal fun writeConsoleJson(list: List<Entry>, net: Map<String, NetReq>, w: JsonSink) {
+        w.beginArray()
         for (e in list) {
-            val o = JSONObject()
-            o.put("time", isoFormat(e.timeMs))
-            o.put("level", e.level)
-            o.put("text", e.text)
-            e.source?.let { o.put("source", it) }
-            e.url?.let { o.put("url", it) }
-            e.line?.let { o.put("line", it) }
-            e.column?.let { o.put("column", it) }
-            e.scriptId?.let { o.put("scriptId", it) }
+            w.beginObject()
+            w.name("time").value(isoFormat(e.timeMs))
+            w.name("level").value(e.level)
+            w.name("text").value(e.text)
+            e.source?.let { w.name("source").value(it) }
+            e.url?.let { w.name("url").value(it) }
+            e.line?.let { w.name("line").value(it) }
+            e.column?.let { w.name("column").value(it) }
+            e.scriptId?.let { w.name("scriptId").value(it) }
             if (e.frames.isNotEmpty()) {
-                val fa = JSONArray()
+                w.name("stackTrace")
+                w.beginArray()
                 for (f in e.frames) {
-                    val fo = JSONObject()
-                    f.functionName?.let { fo.put("functionName", it) }
-                    f.url?.let { fo.put("url", it) }
-                    f.scriptId?.let { fo.put("scriptId", it) }
-                    f.line?.let { fo.put("line", it) }
-                    f.column?.let { fo.put("column", it) }
-                    fa.put(fo)
+                    w.beginObject()
+                    f.functionName?.let { w.name("functionName").value(it) }
+                    f.url?.let { w.name("url").value(it) }
+                    f.scriptId?.let { w.name("scriptId").value(it) }
+                    f.line?.let { w.name("line").value(it) }
+                    f.column?.let { w.name("column").value(it) }
+                    w.endObject()
                 }
-                o.put("stackTrace", fa)
+                w.endArray()
             }
             val nr = e.networkRequestId?.let { net[it] }
             if (e.networkRequestId != null || nr != null) {
-                val no = JSONObject()
-                e.networkRequestId?.let { no.put("requestId", it) }
+                w.name("network")
+                w.beginObject()
+                e.networkRequestId?.let { w.name("requestId").value(it) }
                 if (nr != null) {
-                    nr.method?.let { no.put("method", it) }
-                    nr.url?.let { no.put("url", it) }
-                    nr.status?.let { no.put("status", it) }
-                    nr.mimeType?.let { no.put("mimeType", it) }
-                    nr.errorText?.let { no.put("errorText", it) }
-                    nr.initiator?.let { no.put("initiator", it) }
+                    nr.method?.let { w.name("method").value(it) }
+                    nr.url?.let { w.name("url").value(it) }
+                    nr.status?.let { w.name("status").value(it) }
+                    nr.mimeType?.let { w.name("mimeType").value(it) }
+                    nr.errorText?.let { w.name("errorText").value(it) }
+                    nr.initiator?.let { w.name("initiator").value(it) }
                 }
-                o.put("network", no)
+                w.endObject()
             }
             // raw is already a JSON text: emit it AS a string
             // instead of re-parsing every entry into a JSONObject
@@ -652,10 +1308,11 @@ class ConsoleLogRecorder {
             // re-serialized, so key order and number formatting
             // may differ from the wire bytes) whenever it was
             // kept under the raw cap.
-            e.raw?.let { o.put("raw", it) }
-            arr.put(o)
+            e.raw?.let { w.name("raw").value(it) }
+            w.endObject()
         }
-        return arr.toString(2)
+        w.endArray()
+        w.flush()
     }
 
     /**
@@ -935,8 +1592,286 @@ class ConsoleLogRecorder {
         private const val HEADERS_OMITTED = "<headers omitted: over size cap>"
         private const val HEADERS_INVALID = "<headers omitted: invalid JSON>"
 
+        /** Replacement for a credential value (FULL-SEC-Q1). */
+        private const val REDACTED_VALUE = "<redacted>"
+
+        /** Header names whose values are credentials by
+         * definition, matched case-insensitively. */
+        private val SENSITIVE_HEADERS = setOf(
+            "authorization", "cookie", "set-cookie", "proxy-authorization"
+        )
+
+        /** Headers whose value is a URL: the value gets
+         * query redaction instead of passing through
+         * (review round 4, SEC-6). */
+        private val URL_VALUED_HEADERS = setOf(
+            "referer", "location", "content-location"
+        )
+
+        /** Body field names whose values are credentials,
+         * matched case-insensitively. */
+        private val SENSITIVE_BODY_KEYS = setOf(
+            "password", "passwd", "pwd", "passphrase",
+            "token", "access_token", "refresh_token", "id_token",
+            "secret", "client_secret", "api_key", "apikey",
+            "authorization", "credential", "credentials"
+        )
+
+        /** Credential words matched as whole name TOKENS:
+         * a name is split into tokens (separators, camelCase
+         * and letter/digit boundaries), and a token equal to
+         * one of these words marks the name. */
+        private val SENSITIVE_NAME_TOKENS = setOf(
+            "password", "passwd", "passphrase", "token", "secret",
+            "credential", "credentials", "authorization",
+            "authentication", "csrf", "xsrf", "otp", "apikey",
+            // Round 5 (SEC-3): bearer values under their own
+            // names — SAS and CloudFront signatures, JWTs,
+            // session ids, SAML responses.
+            "signature", "sig", "jwt", "session", "bearer",
+            "samlresponse"
+        )
+
+        /** Short or ambiguous names matched only as a WHOLE
+         * name and only for string-shaped values (round 5,
+         * SEC-2; round 6): query and form pairs are always
+         * strings; a JSON member is redacted when its value
+         * is a string or a string array, recursed into when
+         * it is an object ("auth" the container keeps the
+         * round-1 nested behaviour), and left alone when
+         * it is a number or boolean. */
+        private val SENSITIVE_EXACT_SCALAR = setOf(
+            "auth", "cookie", "key", "pass", "pw", "sid", "ticket"
+        )
+
+        /** First tokens that make a trailing "tokens" a
+         * quantity, not a credential list: used by the pair
+         * matcher, whose values are always strings (round
+         * 6). JSON and header plurals are gated on the
+         * value's shape instead (isPluralCredentialName). */
+        private val QUANTIFIER_TOKENS = setOf(
+            "max", "min", "prompt", "completion", "input",
+            "output", "total", "context"
+        )
+
+        /** The standard CORS header names: policy, never
+         * credentials. */
+        private val CORS_HEADERS = setOf(
+            "access-control-allow-origin",
+            "access-control-allow-credentials",
+            "access-control-allow-methods",
+            "access-control-allow-headers",
+            "access-control-expose-headers",
+            "access-control-max-age",
+            "access-control-request-method",
+            "access-control-request-headers",
+            "access-control-allow-private-network"
+        )
+
+        /** Extra token words for HEADERS only: a header
+         * named with "auth" or "cookie" carries a credential
+         * by construction. A body field of the same name is
+         * handled by the scalar rule below instead. */
+        private val SENSITIVE_HEADER_ONLY_TOKENS = setOf("auth", "cookie")
+
+        /** Long, unambiguous credential words also matched
+         * as a token SUFFIX (review round 4, SEN-4): real
+         * names concatenate without separators — accesstoken,
+         * newpassword, clientsecret, csrftoken,
+         * csrfmiddlewaretoken — and token equality alone let
+         * them through. The suffix rule cannot fire on the
+         * pinned lookalikes: footprint ends in none of these,
+         * max_tokens' token is "tokens" (the plural does not
+         * end in "token"), and tokenizer ends in "ize"-side
+         * letters, not the word. Bare plurals (tokens,
+         * secrets, passwords as whole names) deliberately do
+         * NOT match: a "tokens" field in an API payload is
+         * ordinarily a count or a list of public ids, and
+         * max_tokens is a request parameter, not a
+         * credential — the trade-off is recorded in
+         * REVIEW.md. */
+        private val SENSITIVE_NAME_SUFFIXES = listOf(
+            "password", "passwd", "passphrase", "secret",
+            "credential", "credentials", "authorization",
+            "authentication", "token", "csrf", "xsrf"
+        )
+
+        /** Exact names too short to token-match safely. */
+        private val SENSITIVE_BODY_KEYS_EXACT = setOf(
+            "pwd", "pin", "passcode"
+        )
+
+        /** Split a field name into lowercase word tokens:
+         * separators and brackets are boundaries, and so are
+         * camelCase transitions — including the end of an
+         * uppercase run (CSRFToken -> csrf, token) — and
+         * letter/digit transitions (password1 -> password,
+         * 1). */
+        private fun keyTokens(key: String): List<String> {
+            val out = ArrayList<String>()
+            val cur = StringBuilder()
+            fun flush() {
+                if (cur.isNotEmpty()) {
+                    out.add(cur.toString())
+                    cur.setLength(0)
+                }
+            }
+            var prev: Char? = null
+            for (i in key.indices) {
+                val c = key[i]
+                if (c.isLetterOrDigit()) {
+                    val next = key.getOrNull(i + 1)
+                    val pv = prev
+                    val boundary = pv != null && (
+                        (pv.isLowerCase() && c.isUpperCase()) ||
+                            (pv.isDigit() != c.isDigit() && pv.isLetterOrDigit()) ||
+                            (pv.isUpperCase() && c.isUpperCase() &&
+                                next != null && next.isLowerCase())
+                        )
+                    if (boundary) flush()
+                    cur.append(c.lowercaseChar())
+                    prev = c
+                } else {
+                    flush()
+                    prev = null
+                }
+            }
+            flush()
+            return out
+        }
+
+        /** Whether a field or header name marks its value
+         * as a credential: the exact sets, a credential word
+         * as a whole token, a credential word as a token
+         * suffix, or "api" + "key" as adjacent tokens. */
+        private fun isSensitiveName(key: String): Boolean {
+            val n = key.lowercase()
+            if (n in SENSITIVE_BODY_KEYS || n in SENSITIVE_BODY_KEYS_EXACT) {
+                return true
+            }
+            val tokens = keyTokens(key)
+            for (t in tokens) {
+                if (t in SENSITIVE_NAME_TOKENS ||
+                    t in SENSITIVE_BODY_KEYS_EXACT
+                ) {
+                    return true
+                }
+                if (SENSITIVE_NAME_SUFFIXES.any { t.endsWith(it) }) {
+                    return true
+                }
+            }
+            // "<modifier>_key" spelled as two tokens
+            // (api_key, private_key, signing_key, ...).
+            return tokens.zipWithNext().any { (a, b) ->
+                b == "key" && a in KEY_MODIFIERS
+            }
+        }
+
+        /** Modifiers that make a following "key" token a
+         * credential compound (round 6, SEN-10). */
+        private val KEY_MODIFIERS = setOf(
+            "api", "private", "access", "client", "master",
+            "signing", "consumer", "encryption", "license",
+            "app", "auth", "secret"
+        )
+
+        /**
+         * Whether a name has the SHAPE of a compound plural
+         * credential (round 6, SEN-1/PER-2): a plural
+         * credential word at the end (trailing numeric and
+         * container tokens aside), or a concatenated plural
+         * (accesstokens). Shape alone does not redact: the
+         * callers decide by the value — numbers, booleans
+         * and null are kept (the same shape with a number
+         * is a usage count, cache_read_input_tokens),
+         * strings redact, and containers redact their
+         * strings wholesale. A bare plural name (tokens,
+         * secrets) is not compound and never matches.
+         */
+        private fun isPluralCredentialName(key: String): Boolean {
+            val tokens = keyTokens(key).dropLastWhile {
+                it.all { c -> c.isDigit() } || it in CONTAINER_TOKENS
+            }
+            if (tokens.size >= 2) {
+                val last = tokens.last()
+                val singular = last.removeSuffix("s")
+                if (singular == last) return false
+                if (singular in SENSITIVE_NAME_TOKENS ||
+                    SENSITIVE_NAME_SUFFIXES.any { singular.endsWith(it) }
+                ) {
+                    return true
+                }
+                // api_keys / private_keys: the "key" compound
+                // in plural form (round 6, SEC-2).
+                return singular == "key" &&
+                    tokens[tokens.size - 2] in KEY_MODIFIERS
+            }
+            if (tokens.size == 1) {
+                val t = tokens[0]
+                return SENSITIVE_NAME_SUFFIXES.any { w ->
+                    t.length > w.length + 1 && t.endsWith(w + "s")
+                }
+            }
+            return false
+        }
+
+        /** Trailing words that name a container, not the
+         * credential itself (refresh_tokens_list). */
+        private val CONTAINER_TOKENS = setOf(
+            "list", "json", "hash", "map", "set", "array"
+        )
+
+        /** Whether a query/form pair name marks its value
+         * as a credential: the body matcher, plus the
+         * scalar-only exact names (pairs are always
+         * scalar). */
+        private fun isSensitivePairKey(key: String): Boolean {
+            if (key.lowercase() in SENSITIVE_EXACT_SCALAR) return true
+            if (isSensitiveName(key)) return true
+            // Pair values are always strings, so a compound
+            // plural here is a credential list — unless a
+            // quantifier leads (a form field named
+            // max_tokens is a request parameter).
+            if (isPluralCredentialName(key)) {
+                val first = keyTokens(key).firstOrNull()
+                return first !in QUANTIFIER_TOKENS
+            }
+            return false
+        }
+
+        /** Whether a body field name marks its value as a
+         * credential. */
+        private fun isSensitiveBodyKey(key: String): Boolean =
+            isSensitiveName(key)
+
+        /** Whether a header name marks its value as a
+         * credential: the shared name matcher, with the
+         * header-specific exclusions — pseudo-headers carry
+         * addressing, not credentials, and
+         * www-authenticate is a challenge, not a credential. */
+        private fun isSensitiveHeader(name: String): Boolean {
+            val n = name.lowercase()
+            if (n.startsWith(":")) return false
+            if (n == "www-authenticate") return false
+            // The standard CORS headers describe policy,
+            // not credentials (round 5, SEC-4; round 6,
+            // SEN-8: an allowlist, not the prefix — a page
+            // can send any Access-Control-* name it likes).
+            if (n in CORS_HEADERS) return false
+            if (n in SENSITIVE_HEADERS) return true
+            if (keyTokens(name).any { it in SENSITIVE_HEADER_ONLY_TOKENS }) {
+                return true
+            }
+            return isSensitiveName(name)
+        }
+
+        /** Replacement for a body that could not be parsed
+         * for redaction (review round 2, SEN-8): the whole
+         * body is withheld rather than stored raw. */
+        private const val REDACTED_UNPARSEABLE = "<redacted: unparseable body>"
+
         /** The only CDP methods worth a full parse. */
-        private val HANDLED_METHODS = setOf(
+        val HANDLED_METHODS = setOf(
             "Log.entryAdded",
             "Network.requestWillBeSent",
             "Network.responseReceived",

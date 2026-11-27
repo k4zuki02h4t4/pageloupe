@@ -10,7 +10,7 @@ import androidx.webkit.WebViewCompat
  * point is best-effort and never throws into tab management — if
  * the device's WebView lacks multi-profile support, secret tabs
  * simply keep sharing the default profile (the limitation
- * recorded in REVIEW.md for unsupported WebViews). A failure
+ * recorded in the design records for unsupported WebViews). A failure
  * on a SUPPORTED WebView is different: it is
  * reported to the tab's listener so the user can be told the
  * isolation is not in effect (silently degrading on a capable

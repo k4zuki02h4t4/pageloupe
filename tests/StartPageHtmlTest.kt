@@ -10,7 +10,7 @@ import jp.kaleidpixel.pageloupe.startPageHtml
 // else. If the page ever gains a script, image, stylesheet,
 // frame or CSS load, that traffic would silently enter the
 // recordings — this test fails first. Run via
-// tests/run_tests.sh.
+// the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0

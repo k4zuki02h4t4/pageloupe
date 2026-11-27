@@ -131,7 +131,7 @@ class DevToolsSessionState {
      *   secret frontend still need redaction. The re-derivation
      *   does not distinguish a late finish arriving from an
      *   earlier frontend instance; that narrow window is an
-     *   accepted residue recorded in REVIEW.md, so this flag
+     *   accepted residue recorded in the design records, so this flag
      *   alone must not be treated as a windowless guarantee.
      * - A real page marks the frontend loaded — unless THIS
      *   finish is the load that just failed ([frontendFailedUrl]

@@ -8,7 +8,7 @@ import java.io.IOException
 // procedure behind the requests JSON export (PER-58). Pure
 // java.io, so the failure paths run here even though the
 // export's JSON producers (org.json / JsonWriter) cannot.
-// Run via tests/run_tests.sh.
+// Run via the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0
@@ -123,6 +123,45 @@ fun main() {
         check("rename failure throws IOException", caught is IOException)
         check("rename failure leaves no tmp", !File(dir, "out.json.tmp").exists())
         check("rename failure keeps the directory", target.isDirectory)
+        dir.deleteRecursively()
+    }
+
+    // The stream variant (SEN-16) writes binary content
+    // through the same tmp + rename path.
+    run {
+        val dir = freshDir("stream")
+        val target = File(dir, "img.bin")
+        val bytes = ByteArray(1024) { (it % 251).toByte() }
+        AtomicFileWrite.writeStream(target) { it.write(bytes) }
+        check(
+            "stream write lands byte-identical",
+            target.readBytes().contentEquals(bytes),
+        )
+        check("stream write leaves no tmp", !File(dir, "img.bin.tmp").exists())
+        dir.deleteRecursively()
+    }
+
+    // A stream block that throws mid-write leaves the old
+    // content in place and no temp behind.
+    run {
+        val dir = freshDir("streamfail")
+        val target = File(dir, "img.bin")
+        target.writeBytes(byteArrayOf(1, 2, 3))
+        var caught: Throwable? = null
+        try {
+            AtomicFileWrite.writeStream(target) { out ->
+                out.write(byteArrayOf(9, 9))
+                throw IOException("compress failed")
+            }
+        } catch (e: Throwable) {
+            caught = e
+        }
+        check("stream failure throws", caught is IOException)
+        check(
+            "stream failure keeps the old content",
+            target.readBytes().contentEquals(byteArrayOf(1, 2, 3)),
+        )
+        check("stream failure leaves no tmp", !File(dir, "img.bin.tmp").exists())
         dir.deleteRecursively()
     }
 

@@ -10,7 +10,7 @@ import jp.kaleidpixel.pageloupe.MenuSpec
 // unwired entry is a compile error rather than a dead row. This
 // suite pins WHAT the menu shows so later feature work cannot
 // silently reorder, rename or reclassify it.
-// Run via tests/run_tests.sh.
+// Run via the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0

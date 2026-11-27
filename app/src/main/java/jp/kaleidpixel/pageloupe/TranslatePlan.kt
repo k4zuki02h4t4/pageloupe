@@ -28,6 +28,13 @@ object TranslatePlan {
     const val MAX_NODES = 2000
     const val MAX_CHARS = 300_000
 
+    /** Per-item cap (SEN-388), aligned with the extraction
+     * script's MAXNODECHARS in PageTranslator: no single node
+     * or title may hand the translator more than this in one
+     * call. The script enforces it for body nodes; buildWork
+     * enforces it again for everything, title included. */
+    const val MAX_ITEM_CHARS = 20_000
+
     /** How much text the language identifier gets: its accuracy
      * plateaus well before this, and a bounded sample keeps the
      * detection step O(1) in page size. */
@@ -654,7 +661,22 @@ object TranslatePlan {
         var chars = 0
         var truncated = scriptCapped
         fun offer(nodeIndex: Int, raw: String): Boolean {
-            val s = split(raw) ?: return true
+            var s = split(raw) ?: return true
+            // Per-item cap (SEN-388): a single item must not
+            // reach the translator unbounded. The extraction
+            // script skips nodes over its own MAXNODECHARS, but
+            // the title bypasses the script, and a tampered page
+            // can hand back oversized node texts, so the cap is
+            // enforced here too, on the Kotlin side, for every
+            // item. An over-long core is cut at the cap and the
+            // remainder rides along as trailing context, which
+            // makes the run honestly partial (truncated).
+            if (s.core.length > MAX_ITEM_CHARS) {
+                var cut = MAX_ITEM_CHARS
+                if (cut > 0 && s.core[cut - 1].isHighSurrogate()) cut--
+                s = Split(s.lead, s.core.substring(0, cut), s.core.substring(cut) + s.trail)
+                truncated = true
+            }
             if (items.size >= MAX_NODES || chars + s.core.length > MAX_CHARS) {
                 truncated = true
                 return false

@@ -8,7 +8,7 @@ import jp.kaleidpixel.pageloupe.FaviconStore
 // exercised on device. FaviconStore's class loads against
 // the android.jar stubs on the runtime classpath; the pure
 // functions never call them.
-// Run via tests/run_tests.sh.
+// Run via the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0

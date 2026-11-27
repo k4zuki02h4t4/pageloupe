@@ -114,6 +114,27 @@ object ExportTree {
                 out.use { o -> input.copyTo(o, COPY_BUFFER_BYTES) }
             }
 
+            override fun writtenLength(handle: Any): Long {
+                // The document's own size column, queried the
+                // same way the tree walks below query theirs;
+                // any failure to say reads as "cannot say".
+                return try {
+                    context.contentResolver.query(
+                        handle as Uri,
+                        arrayOf(DocumentsContract.Document.COLUMN_SIZE),
+                        null, null, null
+                    )?.use { cursor ->
+                        if (cursor.moveToFirst() && !cursor.isNull(0)) {
+                            cursor.getLong(0)
+                        } else {
+                            -1L
+                        }
+                    } ?: -1L
+                } catch (_: Exception) {
+                    -1L
+                }
+            }
+
             override fun discard(handle: Any): Boolean =
                 deleteDocument(context, handle as Uri)
         }

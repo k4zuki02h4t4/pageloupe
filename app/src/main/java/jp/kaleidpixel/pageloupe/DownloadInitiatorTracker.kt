@@ -12,7 +12,7 @@ package jp.kaleidpixel.pageloupe
  * is what this tracker records; a subframe script that
  * navigates the top frame therefore classifies as MAIN_FRAME,
  * the same residual the popup rules accept for target=_top
- * (recorded in REVIEW.md).
+ * (recorded in the design records).
  *
  * Lifetime rules, all event-driven:
  * - Every attempt overwrites the record, redirect hops

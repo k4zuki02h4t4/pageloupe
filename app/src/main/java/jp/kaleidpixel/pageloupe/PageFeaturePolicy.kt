@@ -170,7 +170,7 @@ object PageFeaturePolicy {
      * the parent domain's cookies) is NOT accepted: on shared
      * hosting (github.io and friends) the parent is effectively
      * another site. This is a suffix approximation without the
-     * Public Suffix List, recorded as such in REVIEW.md.
+     * Public Suffix List, recorded as such in the design records.
      */
     fun isSameOrSubdomain(downloadHost: String?, pageHost: String?): Boolean {
         if (downloadHost.isNullOrEmpty() || pageHost.isNullOrEmpty()) return false
@@ -184,7 +184,7 @@ object PageFeaturePolicy {
      * fact the WebView callbacks carry — not proof of which
      * frame's script initiated it: a subframe that navigates
      * the top frame classifies as MAIN_FRAME (the residual is
-     * recorded in REVIEW.md).
+     * recorded in the design records).
      */
     enum class DownloadFrame {
         /** The tab's own main frame: the page the user is looking at. */
@@ -221,7 +221,7 @@ object PageFeaturePolicy {
      *   page, an unrelated host — and no committed page at all
      *   (a typed or restored navigation that goes straight to a
      *   download carries no cookie; go via the site instead).
-     *   That trade-off is recorded in REVIEW.md.
+     *   That trade-off is recorded in the design records.
      */
     fun shouldAttachCookie(
         downloadUrl: String,

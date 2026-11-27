@@ -8,7 +8,7 @@ import java.io.IOException
 // failure classification (which failures clear the saved
 // destination), the document-id display-name fallback, size
 // formatting and the result toast's wording. The SAF wiring
-// itself is covered on device. Run via tests/run_tests.sh.
+// itself is covered on device. Run via the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0

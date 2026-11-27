@@ -14,35 +14,64 @@ What is asserted, all from the APK's own binary manifest
     including each component's android:exported value;
   - the uses-permission set equals app/manifest-permissions.txt;
   - exactly one <permission> element exists, the
-    signature-protected DYNAMIC_RECEIVER one androidx declares;
+    signature-protected DYNAMIC_RECEIVER one androidx declares,
+    its name derived from the caller-reported application id;
   - the structural inventory equals app/manifest-structure.txt:
-    the set of element tags, the application element's
-    attribute names, every <meta-data> entry (name, owning
-    parent, and value where the allowlist pins one), every
-    intent surface (per owning component: its filters'
-    action, category and data-scheme names), and the
-    application id itself — the manifest's package attribute
-    and the caller-reported id must both equal the pinned
-    value;
+    the set of element tags, the application element's and the
+    manifest element's attribute names, the uses-sdk values
+    (minSdkVersion / targetSdkVersion), every <meta-data>
+    entry (name, owning parent, and value where the allowlist
+    pins one), every intent surface (per owning component,
+    and per <intent> inside <queries> alike: action, category
+    and data-scheme names), and the application id itself —
+    the manifest's package attribute and the caller-reported
+    id must both equal the pinned value;
+  - every android-namespaced attribute the gate pins by name
+    prints with its true android resource id, in both
+    directions (a pinned name carrying a foreign id, or a
+    pinned id printed under a different name, both fail) —
+    the platform resolves attributes by id, so a name/id
+    disagreement is a value the gate and the platform would
+    read differently. The namespace-less attributes on the
+    <manifest> element (package, platformBuildVersionCode,
+    platformBuildVersionName) carry no id by construction; a
+    separate rule confines bare attributes to that element
+    and treats an id printed on one as a problem;
+  - element counts and placement: <manifest>, <application>
+    and <uses-sdk> appear exactly once each; components sit
+    directly under <application>; <permission>, <uses-sdk>,
+    <queries> and <uses-permission> sit directly under
+    <manifest>; <intent> appears only inside <queries>, and
+    action / category / data only inside an intent-filter or
+    an <intent>; a nested <manifest> or an intent-filter with
+    no owning component is a problem. The parse itself is
+    fail-closed — foreign namespaces, a namespaced attribute
+    printed without an id, duplicate attributes or ids,
+    quotes inside a value, a second namespace declaration and
+    unreadable lines are all problems (see dump_elements);
   - the application element's posture values: no debuggable or
     testOnly attribute, and allowBackup / usesCleartextTraffic /
     extractNativeLibs / appComponentFactory carry the approved
     values;
-  - the ML Kit components the app depends on are present and
-    the datatransport components (whose CCT backend is the
-    telemetry upload path) are absent — implied by the set
-    equality, but spelled out because they are the reason the
-    gate exists.
+  - the ML Kit component the app depends on (the discovery
+    service) is present, and the ML Kit startup provider it
+    deliberately drops plus the datatransport components
+    (whose CCT backend is the telemetry upload path) are
+    absent — implied by the set equality, but spelled out
+    because they are the reason the gate exists.
 
 Not asserted, by design: attribute values that are resource
 references (icon, theme, dataExtractionRules — their resource
 ids shift between builds; their presence is pinned by the
-attribute-name set), intent-filter <data> details beyond the
-scheme (hosts, mime types and path / pathPrefix /
-pathPattern are source-review territory), component
-attributes beyond exported (permission, process, taskAffinity
-and the like), and intent-filter attributes (priority,
-autoVerify).
+attribute-name set), <data> details beyond the scheme, in
+intent-filters and in <queries>' <intent> elements alike
+(hosts, mime types and path / pathPrefix / pathPattern are
+source-review territory), component attributes beyond
+exported (permission, process, taskAffinity and the like),
+intent-filter attributes (priority, autoVerify), and the
+uses-sdk attribute-name set (only the pinned values are
+asserted there, unlike the manifest and application
+elements, whose name sets are pinned).
 
 Fail-closed: on ANY failure — a mismatch, a missing file, an
 aapt2 error — the APK is renamed to <name>.rejected before
@@ -63,11 +92,14 @@ from pathlib import Path
 COMPONENT_TAGS = {"activity", "activity-alias", "service", "receiver", "provider"}
 
 REQUIRED_COMPONENTS = {
-    "com.google.mlkit.common.internal.MlKitInitProvider",
     "com.google.mlkit.common.internal.MlKitComponentDiscoveryService",
 }
 
 FORBIDDEN_COMPONENTS = {
+    # Removed on purpose (PER-3): PageTranslator initializes
+    # ML Kit explicitly at first use, so the startup provider
+    # must not come back through a library merge.
+    "com.google.mlkit.common.internal.MlKitInitProvider",
     "com.google.android.datatransport.runtime.backends"
     ".TransportBackendDiscovery",
     "com.google.android.datatransport.runtime.scheduling.jobscheduling"
@@ -106,8 +138,10 @@ ATTR_RE = re.compile(r"^\s*A: (\S+?)(?:\((0x[0-9a-f]+)\))?=(.*)$")
 ANDROID_NS = "http://schemas.android.com/apk/res/android"
 
 # The android resource ids of every attribute the gate pins
-# by name — the ones whose values it reads, plus every member
-# of the application and manifest attribute-name sets —
+# by name — the ones whose values it reads, plus every
+# namespaced member of the application and manifest
+# attribute-name sets (the sets' namespace-less members are
+# BARE_ATTRIBUTES below and carry no id) —
 # measured from the shipped APK's dump (and, for debuggable
 # and testOnly, the framework's published ids). The platform
 # resolves attributes by id, so an attribute whose printed

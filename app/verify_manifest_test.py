@@ -65,7 +65,7 @@ def build_manifest(mutate=None):
     lines = [
         f"N: android={NS} (line=2)",
         "  E: manifest (line=2)",
-        f"    A: {NS}:versionCode(0x0101021b)=113",
+        f"    A: {NS}:versionCode(0x0101021b)=115",
         f'    A: {NS}:versionName(0x0101021c)="0.44.0" (Raw: "0.44.0")',
         f"    A: {NS}:compileSdkVersion(0x01010572)=34",
         f'    A: {NS}:compileSdkVersionCodename(0x01010573)="14"'
@@ -120,9 +120,6 @@ def build_manifest(mutate=None):
         f"                    {a('scheme', 'http')}",
         "                  E: data (line=113)",
         f"                    {a('scheme', 'https')}",
-        "          E: provider (line=200)",
-        f"            {a('name', 'com.google.mlkit.common.internal.MlKitInitProvider')}",
-        f"            A: {NS}:exported(0x01010010)=false",
         "          E: service (line=210)",
         f"            {a('name', DISCOVERY)}",
         f"            A: {NS}:exported(0x01010010)=false",
@@ -138,7 +135,6 @@ def build_manifest(mutate=None):
 COMPONENTS = """\
 jp.kaleidpixel.pageloupe.MainActivity exported=true
 com.google.mlkit.common.internal.MlKitComponentDiscoveryService exported=false
-com.google.mlkit.common.internal.MlKitInitProvider exported=false
 """
 
 PERMISSIONS = "android.permission.INTERNET\n"
@@ -155,7 +151,6 @@ intent-filter
 manifest
 meta-data
 permission
-provider
 queries
 service
 uses-permission
@@ -199,14 +194,15 @@ class FakeCompleted:
         self.stdout = out
 
 
-def run_case(mutate=None, application_id=APP_ID, structure=STRUCTURE):
+def run_case(mutate=None, application_id=APP_ID, structure=STRUCTURE,
+             components=COMPONENTS):
     text = build_manifest(mutate)
     original = vm.subprocess.run
     vm.subprocess.run = lambda *args, **kwargs: FakeCompleted(text)
     try:
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
-            (tmp / "components.txt").write_text(COMPONENTS)
+            (tmp / "components.txt").write_text(components)
             (tmp / "permissions.txt").write_text(PERMISSIONS)
             (tmp / "structure.txt").write_text(structure)
             return vm.verify(
@@ -305,7 +301,7 @@ case(
     "<permission> outside <manifest>",
     ["outside <manifest>"],
     mutate=lambda lines: insert_before(
-        lines, "E: provider",
+        lines, "E: service",
         ["          E: permission (line=301)",
          f"            {a('name', 'a.B')}"]),
 )
@@ -361,7 +357,7 @@ case(
     "uses-permission outside <manifest>",
     ["outside <manifest>"],
     mutate=lambda lines: insert_before(
-        lines, "E: provider",
+        lines, "E: service",
         ["          E: uses-permission (line=302)",
          f"            {a('name', 'android.permission.CAMERA')}"]),
 )
@@ -407,7 +403,7 @@ case(
     ["intent element outside <queries>",
      "intent-filter without a component owner"],
     mutate=lambda lines: insert_before(
-        lines, "E: provider",
+        lines, "E: service",
         ["          E: intent (line=303)"]),
 )
 case(
@@ -453,8 +449,8 @@ case(
     ["unquoted attribute value with trailing content",
      "manifest attribute set mismatch"],
     mutate=lambda lines: replace(
-        lines, ":versionCode(0x0101021b)=113",
-        ":versionCode(0x0101021b)=113 junk"),
+        lines, ":versionCode(0x0101021b)=115",
+        ":versionCode(0x0101021b)=115 junk"),
 )
 case(
     "an unparsable element line",
@@ -487,14 +483,14 @@ case(
     ["nested <manifest>", "exactly one <manifest>",
      "manifest attribute set mismatch", "manifest package must be"],
     mutate=lambda lines: insert_before(
-        lines, "E: provider",
+        lines, "E: service",
         ["          E: manifest (line=304)"]),
 )
 case(
     "a component without a name",
     ["element without a name"],
     mutate=lambda lines: insert_before(
-        lines, "E: provider",
+        lines, "E: service",
         ["          E: activity (line=305)",
          f"            A: {NS}:exported(0x01010010)=true"]),
 )
@@ -502,7 +498,7 @@ case(
     "a relative component name",
     ["relative component name"],
     mutate=lambda lines: insert_before(
-        lines, "E: provider",
+        lines, "E: service",
         ["          E: activity (line=306)",
          f"            {a('name', '.Foo')}",
          f"            A: {NS}:exported(0x01010010)=true"]),
@@ -511,7 +507,7 @@ case(
     "a duplicate component",
     ["duplicate component element"],
     mutate=lambda lines: insert_before(
-        lines, "E: provider",
+        lines, "E: service",
         ["          E: activity (line=307)",
          f"            {a('name', APP_ID + '.MainActivity')}",
          f"            A: {NS}:exported(0x01010010)=true"]),
@@ -520,7 +516,7 @@ case(
     "<queries> outside <manifest>",
     ["outside <manifest>"],
     mutate=lambda lines: insert_before(
-        lines, "E: provider",
+        lines, "E: service",
         ["          E: queries (line=308)"]),
 )
 case(
@@ -530,7 +526,7 @@ case(
      "uses-sdk targetSdkVersion must be 34"],
     mutate=lambda lines: insert_before(
         drop_block(lines, "E: uses-sdk", 3),
-        "E: provider",
+        "E: service",
         ["          E: uses-sdk (line=309)",
          f"            A: {NS}:minSdkVersion(0x0101020c)=33",
          f"            A: {NS}:targetSdkVersion(0x01010270)=34"]),
@@ -582,8 +578,33 @@ def drop_block(lines, marker, count):
 case(
     "a required component missing",
     ["required components missing", "component set mismatch",
+     "meta-data name set mismatch",
+     "value must be com.google.firebase.components"
+     ".ComponentRegistrar"],
+    mutate=lambda lines: replace(
+        lines, "MlKitComponentDiscoveryService",
+        "MlKitComponentDiscoveryServiceRenamed"),
+)
+case(
+    "a forbidden component on the allowlist still fails",
+    ["forbidden components present"],
+    mutate=lambda lines: lines + [
+        "          E: provider (line=312)",
+        f"            {a('name', 'com.google.mlkit.common.internal.MlKitInitProvider')}",
+        f"            A: {NS}:exported(0x01010010)=false"],
+    components=COMPONENTS +
+        "com.google.mlkit.common.internal.MlKitInitProvider exported=false\n",
+    structure=STRUCTURE.replace(
+        "permission\nqueries", "permission\nprovider\nqueries"),
+)
+case(
+    "the dropped ML Kit init provider returns",
+    ["forbidden components present", "component set mismatch",
      "element tag set mismatch"],
-    mutate=lambda lines: drop_block(lines, "E: provider", 3),
+    mutate=lambda lines: lines + [
+        "          E: provider (line=312)",
+        f"            {a('name', 'com.google.mlkit.common.internal.MlKitInitProvider')}",
+        f"            A: {NS}:exported(0x01010010)=false"],
 )
 case(
     "the receiver permission is not signature-level",
@@ -690,11 +711,52 @@ def problems_match(problems, expected):
     return (not unmatched and not remaining), unmatched, remaining
 
 
+def allowlist_id_coverage_problems():
+    """The real structure allowlist's attribute names must
+    all be covered by the verifier's id table (or, for the
+    namespace-less manifest attributes, by BARE_ATTRIBUTES):
+    a name added to the allowlist without a table entry
+    would silently skip the id check the module docstring
+    promises."""
+    structure, problems = vm.read_structure(
+        Path(__file__).parent / "manifest-structure.txt")
+    if problems:
+        return problems
+    out = []
+    for name in sorted(structure["application-attributes"]):
+        if name not in vm.ATTRIBUTE_IDS:
+            out.append(
+                f"application attribute {name!r} has no entry"
+                " in ATTRIBUTE_IDS")
+    for name in sorted(structure["manifest-attributes"]):
+        if (name not in vm.ATTRIBUTE_IDS
+                and name not in vm.BARE_ATTRIBUTES):
+            out.append(
+                f"manifest attribute {name!r} is in neither"
+                " ATTRIBUTE_IDS nor BARE_ATTRIBUTES")
+    for entry in sorted(structure["uses-sdk"]):
+        name = entry.split("=", 1)[0]
+        if name not in vm.ATTRIBUTE_IDS:
+            out.append(
+                f"uses-sdk attribute {name!r} has no entry"
+                " in ATTRIBUTE_IDS")
+    for name in sorted(vm.APPLICATION_POSTURE):
+        if name not in vm.ATTRIBUTE_IDS:
+            out.append(
+                f"posture attribute {name!r} has no entry"
+                " in ATTRIBUTE_IDS")
+    return out
+
+
 def main():
     # Quiet on success (one summary line), detailed on
     # failure: this runs before every packaging, and a wall
     # of PASS lines buries real build output.
     failures = 0
+    coverage = allowlist_id_coverage_problems()
+    if coverage:
+        print(f"FAIL: allowlist attribute id coverage — {coverage}")
+        failures += 1
     for name, expected, kwargs in CASES:
         problems = run_case(**kwargs)
         ok, unmatched, leftover = problems_match(problems, expected)
@@ -706,7 +768,7 @@ def main():
         if not run_main_case(mode):
             print(f"FAIL: {name}")
             failures += 1
-    total = len(CASES) + len(MAIN_CASES)
+    total = len(CASES) + len(MAIN_CASES) + 1
     if failures:
         print(f"verify_manifest_test: {failures} case(s) failed")
         return 1

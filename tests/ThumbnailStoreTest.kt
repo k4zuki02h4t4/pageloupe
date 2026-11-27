@@ -8,7 +8,7 @@ import java.io.File
 // and the prune selection. Pure functions plus plain
 // java.io, so they run here; the bitmap encode/decode
 // (save/load) is Android glue and is covered on-device.
-// Run via tests/run_tests.sh.
+// Run via the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0

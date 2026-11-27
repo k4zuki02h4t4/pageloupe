@@ -4,7 +4,7 @@ import jp.kaleidpixel.pageloupe.PendingSlot
 
 // JVM tests for PendingSlot: the exactly-once holding semantics
 // behind the page-feature interactions (SEN-25). Run via
-// tests/run_tests.sh.
+// the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0

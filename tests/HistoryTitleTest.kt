@@ -7,7 +7,7 @@ import jp.kaleidpixel.pageloupe.HistoryTitle
 // the moment its page commits. The wiring (BrowserTab's
 // flags read inside the commit callback) is device-verified;
 // the decision itself is pinned here.
-// Run via tests/run_tests.sh.
+// Run via the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0

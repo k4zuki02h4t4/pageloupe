@@ -560,9 +560,33 @@ class BookmarkStore {
          * missing lands at the root; a duplicate URL keeps the
          * first row.
          */
-        fun fromJson(json: String): BookmarkStore {
+        fun fromJson(json: String): BookmarkStore =
+            parseDocument(json) ?: BookmarkStore()
+
+        /**
+         * Parse a document written by [toJson], or null when
+         * the document is corrupt AT THE ROOT: not a JSON
+         * object, a format version this build does not write,
+         * or no bookmarks array. Row-level damage is not
+         * corruption (see [fromJson]). The caller evacuates
+         * a root-corrupt file rather than letting the next
+         * save overwrite it unseen (SEN-2).
+         */
+        fun parseDocument(json: String): BookmarkStore? {
+            // Exception-only on purpose (review round 3,
+            // PER-2): runCatching would also catch an
+            // OutOfMemoryError and report a huge but valid
+            // file as corrupt, evacuating it. An Error
+            // propagates to the loader, which treats it as a
+            // read failure (writes blocked, file untouched).
+            val root = try {
+                JSONObject(json)
+            } catch (_: Exception) {
+                return null
+            }
+            if (root.optInt("v", -1) != FORMAT_VERSION) return null
+            if (root.optJSONArray("bookmarks") == null) return null
             val store = BookmarkStore()
-            val root = runCatching { JSONObject(json) }.getOrNull() ?: return store
             var maxId = 0L
             val folderArr = root.optJSONArray("folders")
             if (folderArr != null) {

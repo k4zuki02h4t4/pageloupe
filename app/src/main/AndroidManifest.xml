@@ -8,9 +8,10 @@
          permission pair and the appComponentFactory,
          play-services-basement the gms.version meta-data,
          play-services-base GoogleApiActivity, and the ML Kit AARs
-         MlKitInitProvider plus MlKitComponentDiscoveryService with
-         their four component registrars. What the merger must
-         never bring in is removed explicitly below. -->
+         MlKitComponentDiscoveryService with their four component
+         registrars (their MlKitInitProvider is removed below).
+         What the merger must never bring in is removed explicitly
+         below. -->
 
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- No app code uses this directly, but Chromium's WebView
@@ -86,6 +87,19 @@
             tools:node="remove" />
         <service
             android:name="com.google.android.datatransport.runtime.backends.TransportBackendDiscovery"
+            tools:node="remove" />
+
+        <!-- Deliberately NOT merged from the ML Kit AARs:
+             MlKitInitProvider, the SDK's startup initializer.
+             It ran at every process start although on-device
+             translation is the only ML Kit use in this app;
+             PageTranslator now initializes the SDK explicitly
+             at its first use (PER-3). The component discovery
+             service stays: the registrars it feeds are how
+             the translate and language-id clients find their
+             implementations. -->
+        <provider
+            android:name="com.google.mlkit.common.internal.MlKitInitProvider"
             tools:node="remove" />
 
         <activity

@@ -25,7 +25,7 @@ import java.util.Locale
 // compared by value through Number. Key order and number
 // formatting are likewise out of scope; byte-level output
 // equality stays verified on device. Run via
-// tests/run_tests.sh.
+// the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0
@@ -176,7 +176,7 @@ fun main() {
     run {
         val expected = System.getProperty("pageloupe.test.jsonJar")
         if (expected.isNullOrEmpty()) {
-            println("RecorderRequestsJson: run via tests/run_tests.sh (it passes the pinned jar name) — aborting")
+            println("RecorderRequestsJson: run via the runUnitTests Gradle task (it passes the pinned jar name) — aborting")
             kotlin.system.exitProcess(1)
         }
         val loc = JSONObject::class.java.protectionDomain

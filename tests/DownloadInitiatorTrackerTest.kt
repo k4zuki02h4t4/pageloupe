@@ -10,7 +10,7 @@ import jp.kaleidpixel.pageloupe.PageFeaturePolicy
 // sticky for its URL, a matching classification consumes the
 // record, a new main-frame document clears it, and anything
 // unconfirmed is UNKNOWN (the cookie gate fails closed on
-// it). Run via tests/run_tests.sh.
+// it). Run via the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0

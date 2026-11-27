@@ -8,7 +8,7 @@ import jp.kaleidpixel.pageloupe.savableTabUrl
 // savable-URL rule, the length caps and tolerant decoding.
 // Runs with the test-only JSON-java jar ahead of android.jar,
 // like RecorderJsonTest, because the codec uses org.json.
-// Run via tests/run_tests.sh.
+// Run via the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0
@@ -111,6 +111,30 @@ fun main() {
         "decode drops unsavable urls to blanks",
         hostile?.tabs?.get(0)?.url == "" &&
             hostile?.tabs?.get(1)?.url == "https://ok.example/",
+    )
+
+    // isCorruptDocument draws the SEN-2 line: a written
+    // document (or a well-formed one with no savable tabs)
+    // is not corruption; a broken root is.
+    check(
+        "a written document is not corrupt",
+        !TabSessionCodec.isCorruptDocument(TabSessionCodec.encode(tabs, 0))
+    )
+    check(
+        "garbage is corrupt",
+        TabSessionCodec.isCorruptDocument("not json")
+    )
+    check(
+        "a foreign version is corrupt",
+        TabSessionCodec.isCorruptDocument("""{"v":99,"tabs":[]}""")
+    )
+    check(
+        "a missing tabs array is corrupt",
+        TabSessionCodec.isCorruptDocument("""{"v":1}""")
+    )
+    check(
+        "an empty but well-formed document is not corrupt",
+        !TabSessionCodec.isCorruptDocument("""{"v":1,"tabs":[]}""")
     )
 
     if (failures > 0) {

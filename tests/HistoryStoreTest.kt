@@ -10,7 +10,7 @@ import java.time.ZoneId
 // browsing-history page and the period-scoped deletion
 // (SEN-154). Runs with the test-only JSON-java jar ahead of
 // android.jar, like RecorderJsonTest, because the store's
-// persistence side uses org.json. Run via tests/run_tests.sh.
+// persistence side uses org.json. Run via the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0
@@ -92,20 +92,21 @@ fun main() {
     )
     check("deleteSince null clears all", ranged.deleteSince(null) == 1 && ranged.isEmpty())
 
-    // Cap: the oldest entries fall off beyond MAX_ENTRIES.
-    val capped = HistoryStore()
-    for (i in 0 until HistoryStore.MAX_ENTRIES + 5) {
-        capped.record("https://e$i.example/", "t$i", i.toLong())
+    // No entry-count cap (owner decision, 2026-11-28):
+    // every visit is kept, oldest included, as in ordinary
+    // browsers. 6000 stands in for "past the old 5000 cap".
+    val uncapped = HistoryStore()
+    for (i in 0 until 6005) {
+        uncapped.record("https://e$i.example/", "t$i", i.toLong())
     }
-    check("cap holds", capped.size == HistoryStore.MAX_ENTRIES)
+    check("no cap: everything is kept", uncapped.size == 6005)
     check(
-        "cap drops the oldest",
-        capped.snapshot().last().url == "https://e5.example/",
+        "no cap: the oldest survives",
+        uncapped.snapshot().last().url == "https://e0.example/",
     )
     check(
-        "cap keeps the newest",
-        capped.snapshot().first().url ==
-            "https://e${HistoryStore.MAX_ENTRIES + 4}.example/",
+        "no cap: the newest is first",
+        uncapped.snapshot().first().url == "https://e6004.example/",
     )
 
     // JSON round trip preserves order, titles and timestamps.
@@ -133,6 +134,36 @@ fun main() {
     check(
         "malformed entries are skipped",
         mixed.size == 1 && mixed.snapshot()[0].url == "https://ok.example/",
+    )
+
+    // parseDocument draws the SEN-2 line: root corruption is
+    // null (the caller evacuates the file), entry damage is
+    // not corruption.
+    check(
+        "parseDocument accepts a written document",
+        HistoryStore.parseDocument(original.toJson())?.size == 2,
+    )
+    check(
+        "parseDocument rejects garbage",
+        HistoryStore.parseDocument("not json") == null,
+    )
+    check(
+        "parseDocument rejects a foreign version",
+        HistoryStore.parseDocument("""{"v":99,"entries":[]}""") == null,
+    )
+    check(
+        "parseDocument rejects a missing version",
+        HistoryStore.parseDocument("""{"entries":[]}""") == null,
+    )
+    check(
+        "parseDocument rejects a missing entries array",
+        HistoryStore.parseDocument("""{"v":1}""") == null,
+    )
+    check(
+        "parseDocument tolerates damaged entries",
+        HistoryStore.parseDocument(
+            """{"v":1,"entries":[{"u":"https://ok.example/","t":"ok","at":5},42]}""",
+        )?.size == 1,
     )
 
     // Day grouping: newest day first, input order within a day.
@@ -199,6 +230,28 @@ fun main() {
     check(
         "removeEntry removes the stored instance",
         twins.removeEntry(twins.snapshot()[1]) && twins.size == 1,
+    )
+
+    // Same-document commits record like any other visit
+    // (owner decision, 2026-11-28): an SPA's pushState
+    // trail stays in the history in full, interleaved
+    // origins included. The earlier replacement rule
+    // (SEN-387) went away with the entry cap it protected.
+    val trail = HistoryStore()
+    trail.record("https://other.example/article", "other", 100L)
+    trail.record("https://a.example/start", "start", 200L)
+    trail.record("https://a.example/list", "list", 300L)
+    trail.record("https://a.example/item", "item", 400L)
+    trail.record("https://b.example/two", "two", 500L)
+    check(
+        "a same-document trail is kept in full",
+        trail.snapshot().map { it.url } == listOf(
+            "https://b.example/two",
+            "https://a.example/item",
+            "https://a.example/list",
+            "https://a.example/start",
+            "https://other.example/article",
+        ),
     )
 
     // The home marker constant is pinned so it cannot drift

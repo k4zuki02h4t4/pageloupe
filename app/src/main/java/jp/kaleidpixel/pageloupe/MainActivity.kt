@@ -266,10 +266,25 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
         const val STATE_LAUNCH_LINK_DIGEST = "pageloupe.launchLinkDigest"
         /** Browsing-history file in internal storage (SEN-154). */
         const val HISTORY_FILE_NAME = "history.json"
+        /** Debounce window for history writes (PER-4). */
+        const val HISTORY_PERSIST_DEBOUNCE_MS = 1000L
         /** Saved open-tab session file in internal storage (SEN-154). */
         const val TAB_SESSION_FILE_NAME = "tab-session.json"
         /** Bookmarks file in internal storage. */
         const val BOOKMARKS_FILE_NAME = "bookmarks.json"
+
+        /**
+         * Session writes blocked for the rest of the PROCESS
+         * (review round 3, SEN-9): the session file could not
+         * be read (or a corrupt copy could not be set aside),
+         * so no save may overwrite it. Process scope — not an
+         * Activity field — because loadSavedSession runs only
+         * on the cold-start path: an Activity recreated with a
+         * Bundle never re-reads the file, and an instance
+         * field would silently unblock the overwrite this
+         * flag exists to prevent.
+         */
+        @Volatile var tabSessionWriteBlocked = false
         /** Separator in folder-path displays (the breadcrumb
          * view draws the glyph without the spaces and pads
          * instead). One notation everywhere (SEN-254). */
@@ -296,36 +311,9 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
         /** startActivityForResult code for the console-export folder picker. */
         const val REQ_EXPORT_TREE = 4103
 
-        /** True while a console-export move runs on the log-file
-         * executor. Process-wide like the executor itself: an
-         * Activity instance field would reset on recreation
-         * (density / locale / uiMode) while the move keeps
-         * running, reopening the double-run the flag exists to
-         * prevent. Touched only on the UI thread (set before the
-         * executor is handed the work, cleared in its completion
-         * post). */
-        var exportMoveInFlight = false
-
-        /** Recordings waiting for the folder picker's answer.
-         * Process-wide like [exportMoveInFlight]: the picker
-         * can outlive the instance that opened it (recreation
-         * while it shows), and the answer is handled by
-         * whichever instance is current then. */
-        var pendingExportNames: List<String>? = null
-
-        /** Whether the folder picker is currently open. One
-         * picker at a time: a second launch (a fast double
-         * tap) could stack two pickers whose results race the
-         * destination swap. Cleared when the result returns. */
-        var exportPickerOpen = false
-
-        /** The live instance that export-move completions aim
-         * their view work at. A move can outlive the instance
-         * that started it (recreation mid-move); the page
-         * refresh and the picker re-open belong to whichever
-         * instance is current when the move lands. Registered
-         * in onResume, cleared in onDestroy. */
-        var exportUiHost: java.lang.ref.WeakReference<MainActivity>? = null
+        // The console-export flow's process-wide state and
+        // its serial executor live in ExportController
+        // (SEN-6).
         /** Consecutive renderer deaths after which a tab stops auto-reloading its URL. */
         const val MAX_RENDERER_AUTO_RELOADS = 2
         /** WebView-side permission cancels per tab after which prompting is suppressed. */
@@ -341,28 +329,12 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
          * Total tab cap for tabs created from EXTERNAL links only
          * (the switcher / menu path is the user's own action and
          * stays uncapped). Generous against the expected scale of
-         * a few dozen tabs (REVIEW.md).
+         * a few dozen tabs (design records).
          */
         const val MAX_TABS = 100
         /**
-         * Serializes every log-file operation (export writes,
-         * tap-debug writes, clear-data deletions) on one daemon
-         * thread, so a deletion can never be overtaken by an
-         * in-flight export write. It lives in the
-         * companion — process-wide, exactly one — because an
-         * instance field would silently break that guarantee
-         * whenever the Activity is recreated: the old instance's
-         * queued export and the new instance's clear-data delete
-         * would then run on different threads. Never shut down.
-         */
-        val logFileExecutor: java.util.concurrent.ExecutorService =
-            java.util.concurrent.Executors.newSingleThreadExecutor { r ->
-                Thread(r, "pl-log-files").apply { isDaemon = true }
-            }
-
-        /**
          * The history and tab-session writers' own thread,
-         * separate from [logFileExecutor]: closing the last tab
+         * separate from [ExportController.logFileExecutor]: closing the last tab
          * flushes the session writer, and that wait must never
          * queue behind a DevTools log export (which can carry
          * thousands of entries). Same contract as the log
@@ -440,8 +412,7 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
             // state must not stay behind and mute the picker
             // for the process's lifetime. (A recreation keeps
             // both: the result still arrives, to this instance.)
-            exportPickerOpen = false
-            pendingExportNames = null
+            ExportController.abandonPicker()
         }
         Colors.load(this)
         applyWebContentsDebugging()
@@ -462,7 +433,7 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
         // what makes the blank-restored secret tabs honest — they
         // must not revive the previous session's logins), and the
         // cache / Service Worker residue follows the residual
-        // recorded in REVIEW.md until a delete succeeds. No-op
+        // recorded in the design records until a delete succeeds. No-op
         // when no secret profile exists or multi-profile is
         // unsupported.
         SecretProfile.wipe("activity create")
@@ -496,8 +467,7 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
         bookmarkWriter = QueuedFileWriter(
             java.io.File(filesDir, BOOKMARKS_FILE_NAME), stateFileExecutor,
         ) { DebugLog.log("bookmark", "write failed: $it") }
-        loadHistory()
-        loadBookmarks()
+        loadStores()
         // One launch-link decision for every start branch below
         // (audit hardening): a relaunch from Recents redelivers
         // the ORIGINAL launch intent, link included, and the
@@ -520,36 +490,23 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
             val restoredDesktops = savedInstanceState.getBooleanArray(STATE_TAB_DESKTOPS)
             val restoredActive = savedInstanceState.getInt(STATE_ACTIVE_IDX, 0)
                 .coerceIn(0, restoredUrls.size - 1)
-            var newActive: BrowserTab? = null
-            withRestoringTabs {
-                for ((i, u) in restoredUrls.withIndex()) {
-                    // Background tabs are rebuilt but not loaded: loading
-                    // every tab at once after a process restart is the
-                    // fastest way to die of memory pressure again. Their
-                    // URL is deferred until the tab is first shown
-                    // (switchTo consumes deferredUrl).
-                    val t = newTab(secret = restoredSecrets?.getOrNull(i) ?: false, activate = false)
-                    // Desktop mode is part of the saved tab state too;
-                    // absent in bundles written by
-                    // older builds, where it defaults to mobile.
-                    t.adoptDesktopMode(restoredDesktops?.getOrNull(i) ?: false)
-                    // The restored URL is re-validated through
-                    // the same rule the writer used (run-3
-                    // hardening): the Bundle is app-written, so
-                    // this is defense in depth — but the session
-                    // file's decode re-validates its side, and
-                    // the two restore paths should not drift
-                    // apart on what a display URL may be.
-                    val checkedUrl = savableTabUrl(u)
-                    if (BrowserTab.isHomeUrl(checkedUrl)) {
-                        t.loadHome()
-                    } else {
-                        t.currentUrl = checkedUrl
-                        t.deferredUrl = checkedUrl
-                    }
-                    if (i == restoredActive) newActive = t
-                }
-            }
+            // The restored URL is re-validated through the
+            // same rule the writer used (run-3 hardening):
+            // the Bundle is app-written, so this is defense
+            // in depth — but the session file's decode
+            // re-validates its side, and the two restore
+            // paths should not drift apart on what a display
+            // URL may be (rebuildTabs is the shared loop).
+            val newActive = rebuildTabs(
+                restoredUrls.mapIndexed { i, u ->
+                    Triple(
+                        u,
+                        restoredSecrets?.getOrNull(i) ?: false,
+                        restoredDesktops?.getOrNull(i) ?: false
+                    )
+                },
+                restoredActive
+            ) { savableTabUrl(it) }
             // getIntent() keeps returning the ORIGINAL launch
             // intent on every recreation. If that intent carries a
             // link this instance chain has not consumed yet, the
@@ -562,7 +519,6 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
             // and are never replayed through this path, so they
             // must not overwrite the marker.
             launchLinkDigest = savedInstanceState.getString(STATE_LAUNCH_LINK_DIGEST)
-            val toOpen = launchLinkToOpen(launchData, launchLinkDigest)
             // The link is consumed either way: opened now, or
             // refused at the tab cap. A refusal is a decision, not
             // a deferral -- an unconsumed refused link would retry
@@ -571,12 +527,8 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
             // the cap. When it was not opened,
             // the restored active tab is activated instead, so
             // the activity never ends up with no active tab.
-            val opened = if (toOpen != null) {
-                launchLinkDigest = urlDigest(toOpen)
-                openExternalLink(toOpen)
-            } else {
-                false
-            }
+            val link = consumeLaunchLink(launchData)
+            val opened = link != null && openExternalLink(link)
             if (!opened) {
                 // switchTo loads the active tab's deferred URL.
                 newActive?.let { switchTo(it) }
@@ -593,42 +545,34 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
                 // Bundle — but their profile was wiped at the
                 // top of this onCreate, so their pages start
                 // logged out.
-                var newActive: BrowserTab? = null
-                withRestoringTabs {
-                    for ((i, st) in session.tabs.withIndex()) {
-                        val t = newTab(secret = st.secret, activate = false)
-                        t.adoptDesktopMode(st.desktop)
-                        if (st.url.isEmpty() || BrowserTab.isHomeUrl(st.url)) {
-                            t.loadHome()
-                        } else {
-                            t.currentUrl = st.url
-                            t.deferredUrl = st.url
-                        }
-                        if (i == session.activeIndex) newActive = t
-                    }
-                }
+                val newActive = rebuildTabs(
+                    session.tabs.map { Triple(it.url, it.secret, it.desktop) },
+                    session.activeIndex
+                ) { it }
                 // A launch link on a cold start opens as its own
                 // tab, like a link delivered to a running
                 // instance; the digest keeps a later recreation
                 // from replaying it (same contract as the Bundle
-                // path above).
-                val startUrl = launchData
-                val opened = if (isWebLink(startUrl)) {
-                    launchLinkDigest = urlDigest(startUrl!!)
-                    openExternalLink(startUrl)
-                } else {
-                    false
+                // path above, through the same consumeLaunchLink).
+                if (savedInstanceState != null) {
+                    launchLinkDigest =
+                        savedInstanceState.getString(STATE_LAUNCH_LINK_DIGEST)
                 }
+                val link = consumeLaunchLink(launchData)
+                val opened = link != null && openExternalLink(link)
                 if (!opened) {
                     newActive?.let { switchTo(it) }
                     updateTabCount()
                 }
             } else {
-                val startUrl = launchData
                 val first = newTab()
-                if (isWebLink(startUrl)) {
-                    first.loadInput(startUrl!!)
-                    launchLinkDigest = urlDigest(startUrl)
+                // The fresh start loads the link into the first
+                // tab itself rather than opening a second one;
+                // the consume decision (and its digest) is the
+                // shared one.
+                val link = consumeLaunchLink(launchData)
+                if (link != null) {
+                    first.loadInput(link)
                 } else {
                     first.loadHome()
                 }
@@ -647,12 +591,70 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
         // Every back lands in handleBack(): peel an open overlay,
         // then the page history, then finish. "Forward" is the
         // menu action only. The design history (SEN-165 -> SEN-174
-        // -> SEN-180) is recorded in REVIEW.md. minSdk is 33:
+        // -> SEN-180) is recorded in the design records. minSdk is 33:
         // OnBackInvokedCallback is the newest API this needs.
         onBackInvokedDispatcher.registerOnBackInvokedCallback(
             android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,
             android.window.OnBackInvokedCallback { handleBack() }
         )
+    }
+
+    /**
+     * Rebuild a restored tab set (SEN-18: the one loop both
+     * restore paths share). Background tabs are rebuilt but
+     * not loaded: loading every tab at once after a process
+     * restart is the fastest way to die of memory pressure
+     * again; their URL is deferred until the tab is first
+     * shown (switchTo consumes deferredUrl). [checkedUrl]
+     * re-validates each URL the caller's way (the Bundle
+     * path re-checks through savableTabUrl; the session
+     * file's decode already validated its side). A home or
+     * empty URL restores as the home display. Returns the
+     * tab at [activeIndex], coerced into range.
+     */
+    private fun rebuildTabs(
+        entries: List<Triple<String, Boolean, Boolean>>,
+        activeIndex: Int,
+        checkedUrl: (String) -> String
+    ): BrowserTab? {
+        if (entries.isEmpty()) return null
+        val active = activeIndex.coerceIn(0, entries.size - 1)
+        var newActive: BrowserTab? = null
+        withRestoringTabs {
+            for ((i, e) in entries.withIndex()) {
+                val t = newTab(secret = e.second, activate = false)
+                // Desktop mode is part of the saved tab state;
+                // absent in state written by older builds,
+                // where it defaults to mobile.
+                t.adoptDesktopMode(e.third)
+                val url = checkedUrl(e.first)
+                if (url.isEmpty() || BrowserTab.isHomeUrl(url)) {
+                    t.loadHome()
+                } else {
+                    t.currentUrl = url
+                    t.deferredUrl = url
+                }
+                if (i == active) newActive = t
+            }
+        }
+        return newActive
+    }
+
+    /**
+     * The launch link this start consumes, or null (SEN-18:
+     * the one decision every start branch shares).
+     * Consumption is recorded as a fixed-length digest of
+     * the LAUNCH link only — links delivered later arrive
+     * via onNewIntent and are never replayed through this
+     * path, so they must not overwrite the marker. The
+     * digest is set whether or not the caller manages to
+     * open the link (a tab-cap refusal is a decision, not a
+     * deferral).
+     */
+    private fun consumeLaunchLink(rawData: String?): String? {
+        val toOpen = launchLinkToOpen(rawData, launchLinkDigest) ?: return null
+        launchLinkDigest = urlDigest(toOpen)
+        return toOpen
     }
 
     /**
@@ -823,9 +825,24 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
             // so pad by whichever reaches higher, the navigation bar or the
             // IME: the bottom bars (URL bar / tab search) then always sit
             // directly above the keyboard.
-            val bars = insets.getInsets(android.view.WindowInsets.Type.systemBars())
+            // The cutout joins the bars (SEN-23): on a device
+            // whose camera cutout reaches into the content
+            // area in landscape, the bars alone would let
+            // content slide underneath it.
+            val bars = insets.getInsets(
+                android.view.WindowInsets.Type.systemBars() or
+                    android.view.WindowInsets.Type.displayCutout()
+            )
             val ime = insets.getInsets(android.view.WindowInsets.Type.ime())
-            v.setPadding(0, bars.top, 0, maxOf(bars.bottom, ime.bottom))
+            // Side insets apply too (review round 2,
+            // SEN-15): the cutout in landscape and the
+            // side navigation bars reach in from the left
+            // and right, and padding only the top and
+            // bottom left exactly those cases uncovered.
+            v.setPadding(
+                bars.left, bars.top, bars.right,
+                maxOf(bars.bottom, ime.bottom)
+            )
             insets
         }
 
@@ -2176,7 +2193,7 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
         // The ws= endpoint carries the session token as a path prefix;
         // the proxy accepts nothing else. The token therefore rides
         // in this URL to the frontend host — an accepted residue
-        // recorded in REVIEW.md, bounded by the token dying with
+        // recorded in the design records, bounded by the token dying with
         // the panel session.
         return "$origin$path?ws=127.0.0.1:$port/t/$token/devtools/page/${c.id}"
     }
@@ -2262,7 +2279,7 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
                 "lastParseSample=${if (secretTarget) "<redacted>" else DebugLog.escapeLine(recorder.lastParseSample)}"
             )
         }
-        logFileExecutor.execute {
+        ExportController.logFileExecutor.execute {
             try {
                 java.io.File(ensureLogsDir(), "tap-debug.txt").writeText(text)
             } catch (_: Exception) {
@@ -2319,12 +2336,12 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
             ).show()
             return
         }
-        logFileExecutor.execute {
+        ExportController.logFileExecutor.execute {
             try {
                 // One file at a time -- format, write, release -- so
                 // a near-cap recording does not hold the renderings
-                // in memory at once (three are built as strings;
-                // the requests JSON streams). Throwable is
+                // in memory at once (the two text logs are built as
+                // strings; both JSON exports stream). Throwable is
                 // caught: an OutOfMemoryError here must degrade to
                 // a failed-export toast, not a dead process.
                 // The destination is the app-specific recordings
@@ -2335,10 +2352,10 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
                 // a temp file renamed into place, so a killed
                 // write leaves no truncated recording behind.
                 if (snapshot.isNotEmpty()) {
-                    RecordedLogs.writeText(
-                        this, "devtools-console-$stamp.json",
-                        recorder.toJson(snapshot, network)
-                    )
+                    // Streams like the requests JSON (PER-9).
+                    RecordedLogs.write(this, "devtools-console-$stamp.json") { writer ->
+                        recorder.writeConsoleJson(snapshot, network, writer)
+                    }
                     RecordedLogs.writeText(
                         this, "devtools-console-$stamp.log",
                         recorder.toText(snapshot, network, droppedEntries, tapDropped, tapFailed)
@@ -3026,14 +3043,291 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
 
     // ---------- History, saved tabs and clear data (SEN-154) ----------
 
-    private fun loadHistory() {
-        val file = java.io.File(filesDir, HISTORY_FILE_NAME)
-        historyStore = runCatching {
-            HistoryStore.fromJson(file.readText(Charsets.UTF_8))
-        }.getOrElse { HistoryStore() }
+    /**
+     * Whether the persisted stores have been loaded. The
+     * load runs on the state-file executor (SEN-17 / PER-1:
+     * reading and parsing the whole history file (uncapped
+     * since the 2026-11-28 owner decision) on the UI thread
+     * made startup wait on the disk. Until it
+     * lands, both stores read as empty, mutations driven by
+     * page callbacks queue in [pendingStoreOps], persists
+     * defer, and the history / bookmarks pages render a
+     * loading placeholder — so nothing the user or a page
+     * does in the window can be lost when the loaded
+     * stores land, and no persist can overwrite a file
+     * before it has been read.
+     */
+    private var storesReady = false
+
+    /**
+     * Writes to a store file are blocked for this process
+     * (review round 2, SEN-3): set when the file could not
+     * be READ (a transient I/O failure is not corruption
+     * and must not be evacuated or overwritten) or when a
+     * corrupt file could not be moved aside (overwriting
+     * it would destroy the only copy SEN-2 protects). The
+     * store still works in memory; the file on disk is
+     * left exactly as found, and the next process start
+     * tries to read it again.
+     */
+    private var historyWriteBlocked = false
+    private var bookmarkWriteBlocked = false
+
+    /** Whether an evacuated bookmarks `.corrupt` copy was
+     * present when the stores loaded (round 9): learned
+     * once at load so renders do not stat per frame, and
+     * cleared when a delete-all removes the copy. The
+     * one-time read rests on an invariant: evacuation
+     * happens only during loadStores, never at runtime —
+     * a future runtime evacuation must set this flag too. */
+    private var bookmarkCorruptCopyExists = false
+    private val pendingStoreOps = ArrayDeque<() -> Unit>()
+    private var historyPersistPending = false
+
+    /** A debounced history write is scheduled (PER-4). */
+    private var historyPersistDelayed = false
+
+    /** The in-memory history changed since the last write. */
+    private var historyPersistDirty = false
+    private var bookmarkPersistPending = false
+
+    /** Run [op] now, or once the stores have loaded. */
+    private fun runWhenStoresReady(op: () -> Unit) {
+        if (storesReady) {
+            op()
+        } else {
+            pendingStoreOps.addLast(op)
+        }
     }
 
+    /**
+     * Move a state file that could not be loaded aside
+     * (SEN-2): renamed to "<name>.corrupt" next to the
+     * original, so a corrupt file is never silently
+     * overwritten by the next save — the data may be
+     * recoverable by hand, and the rename is the evidence
+     * it ever existed. Runs on whichever thread detected
+     * the corruption (the load executor, or the UI thread
+     * for the session). Kind only in the log.
+     */
+    private fun evacuateCorruptStateFile(file: java.io.File, kind: String): Boolean {
+        val target = java.io.File(file.parentFile, file.name + ".corrupt")
+        val moved = runCatching {
+            if (target.exists()) target.delete()
+            file.renameTo(target)
+        }.getOrDefault(false)
+        DebugLog.log(kind, "store file unreadable, evacuated=$moved")
+        return moved
+    }
+
+    /**
+     * Load the history and bookmark stores off the UI
+     * thread. A file that is absent starts empty; a file
+     * that is present but root-corrupt is evacuated
+     * (SEN-2) and also starts empty.
+     */
+    private fun loadStores() {
+        val historyFile = java.io.File(filesDir, HISTORY_FILE_NAME)
+        val bookmarksFile = java.io.File(filesDir, BOOKMARKS_FILE_NAME)
+        stateFileExecutor.execute {
+            // Read failure and root corruption are different
+            // events (review round 2, SEN-3 / PER-3): only a
+            // file that was read successfully and failed to
+            // parse is corrupt and evacuated. A read failure
+            // leaves the file untouched and blocks writes to
+            // it for this process, so a transient I/O error
+            // can never present as "all history gone" and
+            // then be made permanent by the next save.
+            var loadedHistory = HistoryStore()
+            var historyBlocked = false
+            if (historyFile.exists()) {
+                val text = try {
+                    historyFile.readText(Charsets.UTF_8)
+                } catch (_: Exception) {
+                    null
+                } catch (_: Error) {
+                    // OutOfMemoryError on a huge file is a
+                    // read failure, not corruption (review
+                    // round 3, PER-2): catching it here is
+                    // what keeps a grown file from becoming
+                    // a crash loop at startup.
+                    null
+                }
+                if (text == null) {
+                    historyBlocked = true
+                    DebugLog.log("history", "store read failed; writes blocked")
+                } else {
+                    val parsed = try {
+                        HistoryStore.parseDocument(text)
+                    } catch (_: Error) {
+                        historyBlocked = true
+                        DebugLog.log("history", "store parse ran out of resources; writes blocked")
+                        null
+                    }
+                    if (historyBlocked) {
+                        // Already handled above: not corruption.
+                    } else if (parsed == null) {
+                        if (!evacuateCorruptStateFile(historyFile, "history")) {
+                            historyBlocked = true
+                        }
+                    } else {
+                        loadedHistory = parsed
+                    }
+                }
+            }
+            var loadedBookmarks = BookmarkStore()
+            var bookmarkBlocked = false
+            if (bookmarksFile.exists()) {
+                val text = try {
+                    bookmarksFile.readText(Charsets.UTF_8)
+                } catch (_: Exception) {
+                    null
+                } catch (_: Error) {
+                    // OutOfMemoryError on a huge file is a
+                    // read failure, not corruption (review
+                    // round 3, PER-2): catching it here is
+                    // what keeps a grown file from becoming
+                    // a crash loop at startup.
+                    null
+                }
+                if (text == null) {
+                    bookmarkBlocked = true
+                    DebugLog.log("bookmark", "store read failed; writes blocked")
+                } else {
+                    val parsed = try {
+                        BookmarkStore.parseDocument(text)
+                    } catch (_: Error) {
+                        bookmarkBlocked = true
+                        DebugLog.log("bookmark", "store parse ran out of resources; writes blocked")
+                        null
+                    }
+                    if (bookmarkBlocked) {
+                        // Already handled above: not corruption.
+                    } else if (parsed == null) {
+                        if (!evacuateCorruptStateFile(bookmarksFile, "bookmark")) {
+                            bookmarkBlocked = true
+                        }
+                    } else {
+                        loadedBookmarks = parsed
+                    }
+                }
+            }
+            val bookmarkCorrupt = java.io.File(
+                filesDir, "$BOOKMARKS_FILE_NAME.corrupt"
+            ).exists()
+            runOnUiThread {
+                onStoresLoaded(
+                    loadedHistory, loadedBookmarks,
+                    historyBlocked, bookmarkBlocked, bookmarkCorrupt
+                )
+            }
+        }
+    }
+
+    /** The stores landed: swap in, replay, refresh. */
+    private fun onStoresLoaded(
+        loadedHistory: HistoryStore,
+        loadedBookmarks: BookmarkStore,
+        historyBlocked: Boolean,
+        bookmarkBlocked: Boolean,
+        bookmarkCorrupt: Boolean
+    ) {
+        if (isDestroyed) return
+        historyStore = loadedHistory
+        bookmarkStore = loadedBookmarks
+        historyWriteBlocked = historyBlocked
+        bookmarkWriteBlocked = bookmarkBlocked
+        bookmarkCorruptCopyExists = bookmarkCorrupt
+        storesReady = true
+        while (pendingStoreOps.isNotEmpty()) {
+            // A replayed op that fails is logged by kind
+            // (review round 2, SEN-5): swallowing it
+            // silently would make a lost mutation
+            // indistinguishable from a successful one.
+            runCatching { pendingStoreOps.removeFirst()() }
+                .onFailure {
+                    DebugLog.log(
+                        "store",
+                        "queued op failed: ${it.javaClass.simpleName}"
+                    )
+                }
+        }
+        if (historyPersistPending) {
+            historyPersistPending = false
+            persistHistory()
+        }
+        if (bookmarkPersistPending) {
+            bookmarkPersistPending = false
+            persistBookmarks()
+        }
+        // While bookmark writes are blocked the store is
+        // empty because its file could not be read — healing
+        // against it would prune every favicon as an orphan
+        // (review round 3, SEN-2). The heal runs on a later
+        // start that reads the file successfully.
+        if (!bookmarkWriteBlocked) healBookmarkIcons()
+        refreshAddressBar()
+        if (::historyPage.isInitialized &&
+            historyPage.visibility == View.VISIBLE
+        ) {
+            renderHistory()
+        }
+        if (::bookmarksPage.isInitialized &&
+            bookmarksPage.visibility == View.VISIBLE
+        ) {
+            renderBookmarks()
+        }
+    }
+
+    private val historyPersistFlush = Runnable { writeHistoryNow() }
+
+    /** Debounce clock for the history write: posted on the
+     * main Looper directly (review round 2, SEN-6), not on
+     * the root view — a postDelayed on a detached view may
+     * never run. */
+    private val mainHandler =
+        android.os.Handler(android.os.Looper.getMainLooper())
+
     private fun persistHistory() {
+        if (!storesReady) {
+            // Never write a store that has not been read:
+            // the snapshot would be the empty pre-load store.
+            historyPersistPending = true
+            return
+        }
+        historyPersistDirty = true
+        // Debounced (PER-4): bursts of commits (redirect
+        // chains, pushState-heavy pages, title fill-ins right
+        // after the commit) coalesce into one write, because
+        // the snapshot is taken at flush time and therefore
+        // loses nothing. onPause flushes immediately, and a
+        // clear calls writeHistoryNow itself: a kill inside
+        // the debounce window must not resurrect cleared
+        // history. (The window throttles I/O only; it never
+        // decides whether state is final.)
+        if (historyPersistDelayed) return
+        historyPersistDelayed = true
+        mainHandler.postDelayed(historyPersistFlush, HISTORY_PERSIST_DEBOUNCE_MS)
+    }
+
+    /** Write the history snapshot now if one is owed,
+     * cancelling any pending debounced write. */
+    private fun writeHistoryNow() {
+        mainHandler.removeCallbacks(historyPersistFlush)
+        historyPersistDelayed = false
+        if (!storesReady) {
+            if (historyPersistDirty) historyPersistPending = true
+            return
+        }
+        if (!historyPersistDirty && !historyPersistPending) return
+        historyPersistDirty = false
+        historyPersistPending = false
+        if (historyWriteBlocked) {
+            // The on-disk file was never read (SEN-3): the
+            // in-memory state must not overwrite it.
+            DebugLog.log("history", "write skipped: store file unread")
+            return
+        }
         // Only the snapshot (a reference copy) is taken here;
         // the writer serializes it on its own thread.
         val snapshot = historyStore.snapshot()
@@ -3042,11 +3336,9 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
 
     // ---------- Bookmarks ----------
 
-    private fun loadBookmarks() {
-        val file = java.io.File(filesDir, BOOKMARKS_FILE_NAME)
-        bookmarkStore = runCatching {
-            BookmarkStore.fromJson(file.readText(Charsets.UTF_8))
-        }.getOrElse { BookmarkStore() }
+    /** The bookmark-icon housekeeping that used to run at
+     * the end of the synchronous load (see loadStores). */
+    private fun healBookmarkIcons() {
         // Housekeeping off the UI thread: prune orphaned icon
         // files (deletes that never reached the disk side —
         // the prune runs even when nothing is flagged, or the
@@ -3086,6 +3378,15 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
     }
 
     private fun persistBookmarks() {
+        if (!storesReady) {
+            bookmarkPersistPending = true
+            return
+        }
+        if (bookmarkWriteBlocked) {
+            // The on-disk file was never read (SEN-3).
+            DebugLog.log("bookmark", "write skipped: store file unread")
+            return
+        }
         // Serialized here on the UI thread (the store is not
         // thread-safe); the writer only does the file I/O.
         val json = bookmarkStore.toJson()
@@ -3123,22 +3424,27 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
                 )
             }
             runOnUiThread {
-                faviconSavesInFlight.remove(entryId)
-                if (failure != null) return@runOnUiThread
-                val cur = bookmarkStore.bookmark(entryId)
-                if (cur != null && cur.url == url) {
-                    // The cache is filled only for an entry
-                    // that still lives at this URL: a save
-                    // landing after a delete must not leave
-                    // the icon behind in memory.
-                    faviconCache.put(url, scaled)
-                    faviconLoadFailed.remove(url)
-                    if (!cur.hasFavicon) {
-                        bookmarkStore.setHasFavicon(entryId, true)
-                        persistBookmarks()
+                // The flag confirmation reads the store, so it
+                // waits for the load like every other store
+                // write (SEN-17).
+                runWhenStoresReady {
+                    faviconSavesInFlight.remove(entryId)
+                    if (failure != null) return@runWhenStoresReady
+                    val cur = bookmarkStore.bookmark(entryId)
+                    if (cur != null && cur.url == url) {
+                        // The cache is filled only for an entry
+                        // that still lives at this URL: a save
+                        // landing after a delete must not leave
+                        // the icon behind in memory.
+                        faviconCache.put(url, scaled)
+                        faviconLoadFailed.remove(url)
+                        if (!cur.hasFavicon) {
+                            bookmarkStore.setHasFavicon(entryId, true)
+                            persistBookmarks()
+                        }
                     }
+                    refreshBookmarkIcons()
                 }
-                refreshBookmarkIcons()
             }
         }
     }
@@ -3234,6 +3540,13 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
     private fun toggleBookmark(t: BrowserTab) {
         val url = t.currentUrl
         if (!isWebLink(url) || BrowserTab.isHomeUrl(url)) return
+        if (!storesReady) {
+            // A toggle against the pre-load store would be
+            // lost when the loaded store lands (SEN-17). The
+            // window is the load itself; the tap is ignored.
+            hideMenu()
+            return
+        }
         hideMenu()
         val existing = bookmarkStore.findByUrl(url)
         if (existing != null) {
@@ -3713,9 +4026,9 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
         // state reuses views that are already correct and
         // a different state rebuilds (SEN-268).
         if (searching || !atTop) renderBookmarkPath(searching)
-        bookmarkDeleteAllButton.isEnabled = !bookmarkStore.isEmpty()
+        bookmarkDeleteAllButton.isEnabled = bookmarksClearable()
         bookmarkDeleteAllButton.setColorFilter(
-            if (bookmarkStore.isEmpty()) Colors.OUTLINE else Colors.ICON,
+            if (bookmarksClearable()) Colors.ICON else Colors.OUTLINE,
         )
         val items = ArrayList<BookmarkListItem>()
         if (searching) {
@@ -3734,6 +4047,16 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
         bookmarkItems = items
         if (items.isEmpty()) {
             bookmarkEmptyText.text = when {
+                // Still loading (SEN-17): not "no bookmarks",
+                // and no rows exist to act on until the store
+                // lands and this render runs again.
+                !storesReady -> "読み込み中…"
+                // The file could not be read: neither "no
+                // bookmarks" nor a search verdict would be
+                // true, and delete-all above is the way out
+                // (round 9, PER-2; order settled round 10).
+                bookmarkWriteBlocked ->
+                    "読み込めませんでした（「すべて削除」で初期化できます）"
                 searching -> "見つかりませんでした"
                 bookmarkStore.isEmpty() -> "ブックマークはありません"
                 else -> "このフォルダは空です"
@@ -3952,6 +4275,10 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
     // ---------- Bookmark dialogs ----------
 
     private fun showBookmarkAddDialog() {
+        // No adds until the store has loaded (SEN-17): an
+        // entry added to the pre-load store would be lost
+        // when the loaded store lands.
+        if (!storesReady) return
         AlertDialog.Builder(this)
             .setItems(arrayOf("ブックマークを追加", "フォルダを作成")) { _, which ->
                 if (which == 0) showBookmarkEditDialog(null) else showNewFolderDialog()
@@ -3973,12 +4300,42 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
             .show()
     }
 
+    /** Whether delete-all has anything to act on: a
+     * non-empty store, a write block (the file still holds
+     * every bookmark), or an evacuated copy. One predicate
+     * for the button and the dialog, and it requires the
+     * stores to be loaded — before that the store is a
+     * placeholder and a clear would silently miss the
+     * real file (round 9, SEN-1/SEC-1). */
+    private fun bookmarksClearable(): Boolean =
+        storesReady && (!bookmarkStore.isEmpty() ||
+            bookmarkWriteBlocked || bookmarkCorruptCopyExists)
+
     private fun showDeleteAllBookmarksConfirm() {
-        if (bookmarkStore.isEmpty()) return
+        // While bookmark writes are blocked the in-memory
+        // store reads empty but the file still holds every
+        // bookmark: delete-all must stay reachable so the
+        // clear can happen at the file level (SEC-2).
+        if (!bookmarksClearable()) return
         AlertDialog.Builder(this)
             .setTitle("すべて削除")
             .setMessage("すべてのブックマークとフォルダを削除します。この操作は元に戻せません。")
             .setPositiveButton("削除") { _, _ ->
+                if (bookmarkWriteBlocked) {
+                    if (!deleteStateFileWithCorruptCopy(BOOKMARKS_FILE_NAME)) {
+                        toastPartialClearFailure()
+                    } else {
+                        bookmarkCorruptCopyExists = false
+                    }
+                    bookmarkWriteBlocked = false
+                } else if (!deleteCorruptCopy(BOOKMARKS_FILE_NAME)) {
+                    // A full clear owes the evacuated copy
+                    // the same end as the other categories
+                    // (round 8, PER-2).
+                    toastPartialClearFailure()
+                } else {
+                    bookmarkCorruptCopyExists = false
+                }
                 bookmarkStore.clear()
                 persistBookmarks()
                 faviconCache.evictAll()
@@ -4326,9 +4683,63 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
     private fun loadSavedSession(): SavedSession? {
         val file = java.io.File(filesDir, TAB_SESSION_FILE_NAME)
         if (!file.exists()) return null
-        return runCatching {
-            TabSessionCodec.decode(file.readText(Charsets.UTF_8))
-        }.getOrNull()
+        val text = runCatching { file.readText(Charsets.UTF_8) }.getOrNull()
+        if (text == null) {
+            // A read failure is not corruption (SEN-3): the
+            // file is left alone and session writes are
+            // blocked for this process, so the next save
+            // cannot overwrite a file nobody managed to read.
+            tabSessionWriteBlocked = true
+            DebugLog.log("tab", "session read failed; writes blocked")
+            return null
+        }
+        val decoded = TabSessionCodec.decode(text)
+        if (decoded == null && TabSessionCodec.isCorruptDocument(text)) {
+            // Root-corrupt (SEN-2): set the file aside rather
+            // than letting the next session save overwrite it
+            // unseen. A well-formed file with no savable tabs
+            // is not corruption and is left alone.
+            evacuateCorruptStateFile(file, "tab")
+        }
+        return decoded
+    }
+
+    /**
+     * Delete only a state file's evacuated `.corrupt` copy,
+     * verifying it is gone (round 6, SEN-9): the full clears
+     * that rewrite the main file anyway still owe the user
+     * the truth about the set-aside copy, which can hold
+     * the same data.
+     */
+    private fun deleteCorruptCopy(name: String): Boolean {
+        return try {
+            java.io.File(filesDir, "$name.corrupt").delete()
+            !java.io.File(filesDir, "$name.corrupt").exists()
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Delete a state file and its evacuated `.corrupt` copy
+     * (SEC-3): a full clear of a category must not leave the
+     * data behind in the set-aside file. Unlinks only — no
+     * content I/O — so the caller's thread is fine.
+     */
+    private fun deleteStateFileWithCorruptCopy(name: String): Boolean {
+        return try {
+            java.io.File(filesDir, name).delete()
+            java.io.File(filesDir, "$name.corrupt").delete()
+            // File.delete() reports failure by return value,
+            // not exception (review round 5, SEC-6): verify
+            // both are actually gone, so a failed unlink of
+            // the set-aside copy is not reported as a
+            // successful clear.
+            !java.io.File(filesDir, name).exists() &&
+                !java.io.File(filesDir, "$name.corrupt").exists()
+        } catch (_: Exception) {
+            false
+        }
     }
 
     /**
@@ -4344,6 +4755,23 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
      */
     private fun saveTabSession() {
         if (restoringTabs) return
+        // Blocked means hands off, unconditionally (review
+        // round 4, PER-4): an empty session here is usually
+        // just the last tab closing, which is NOT the user's
+        // word that the unreadable file may go — the block
+        // exists to protect exactly that file. The one place
+        // a blocked session file is deleted is the clear-data
+        // tabs category, which says so explicitly.
+        // Thumbnail pruning is not the session file (review
+        // round 5, SEN-6): it keeps its own tab-linked
+        // lifetime even while saves are blocked.
+        if (tabSessionWriteBlocked) {
+            pruneThumbnails(
+                tabs.filter { !it.secret }
+                    .map { it.deferredUrl ?: it.currentUrl }
+            )
+            return
+        }
         if (tabs.isEmpty()) {
             sessionWriter.submit { null }
             pruneThumbnails(emptyList())
@@ -4476,8 +4904,8 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
         searchArea.addView(pill)
         column.addView(searchArea)
 
-        // A ListView with recycled rows: the history can hold
-        // 5000 entries, and building a View per entry (the
+        // A ListView with recycled rows: the history is
+        // uncapped, and building a View per entry (the
         // switcher's pattern, fine for dozens of tabs) would
         // hitch the UI thread on every render (SEN-154 review).
         val listFrame = FrameLayout(this)
@@ -4629,8 +5057,26 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
         val del = Ui.iconButton(this, R.drawable.ic_close, "この履歴を削除", 36)
         del.setOnClickListener {
             val entry = holder.entry ?: return@setOnClickListener
+            if (historyWriteBlocked) {
+                // A row delete merges with the on-disk store;
+                // while that store is unreadable the delete
+                // could not be saved and the entry would come
+                // back on the next start. Refuse it openly
+                // instead of pretending (review round 3, SEN-3).
+                android.widget.Toast.makeText(
+                    this, "保存できないため削除できませんでした",
+                    android.widget.Toast.LENGTH_SHORT,
+                ).show()
+                return@setOnClickListener
+            }
             if (historyStore.removeEntry(entry)) {
-                persistHistory()
+                // A delete is a privacy action, not a burst
+                // to coalesce (review round 2, PER-4): write
+                // it now, like the clear-data path, so a
+                // process death inside the debounce window
+                // cannot resurrect a deleted entry.
+                historyPersistDirty = true
+                writeHistoryNow()
                 renderHistory()
             }
         }
@@ -4649,7 +5095,44 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
         return row
     }
 
+    /** A coalesced history render is already posted (PER-3). */
+    private var historyRenderPending = false
+
+    /**
+     * Render the history page, coalescing bursts (review
+     * round 3, PER-3): with same-document commits recorded,
+     * a page rewriting its URL in a loop would otherwise
+     * re-run the full search/group/bind on the UI thread per
+     * commit while the history page is open. User actions
+     * still render immediately via [renderHistory]; only the
+     * commit-driven refresh coalesces.
+     */
+    private fun renderHistoryCoalesced() {
+        if (historyRenderPending) return
+        historyRenderPending = true
+        mainHandler.post {
+            historyRenderPending = false
+            if (::historyPage.isInitialized &&
+                historyPage.visibility == View.VISIBLE
+            ) {
+                renderHistory()
+            }
+        }
+    }
+
     private fun renderHistory() {
+        if (!storesReady) {
+            // The store is still loading (SEN-17): show the
+            // loading state, not "no history", and build no
+            // rows a tap could act on. onStoresLoaded
+            // re-renders when the store lands.
+            historyItems = emptyList()
+            historyEmptyText.text = "読み込み中…"
+            historyEmptyText.visibility = View.VISIBLE
+            historyListView.visibility = View.GONE
+            historyAdapter.notifyDataSetChanged()
+            return
+        }
         val entries = historyStore.search(historyQuery)
         if (entries.isEmpty()) {
             historyItems = emptyList()
@@ -5285,7 +5768,7 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
     }
 
     private fun refreshExportRunButton() {
-        val any = !exportMoveInFlight &&
+        val any = !ExportController.moveInFlight &&
             exportListedNames.any { it in exportCheckedNames }
         exportRunButton.isEnabled = any
         exportRunButton.background = Ui.roundBg(
@@ -5301,9 +5784,9 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
         // files in the old folder and possibly clearing the
         // folder the user just picked: the change control waits
         // for the move like the run button does.
-        exportChangeButton.isEnabled = !exportMoveInFlight
+        exportChangeButton.isEnabled = !ExportController.moveInFlight
         exportChangeButton.setTextColor(
-            if (!exportMoveInFlight) Colors.PRIMARY else Colors.ON_SURFACE_VARIANT,
+            if (!ExportController.moveInFlight) Colors.PRIMARY else Colors.ON_SURFACE_VARIANT,
         )
     }
 
@@ -5315,10 +5798,7 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
         // grant (the change button is also disabled then; this
         // is the same rule at the entry itself), and never
         // twice: one picker at a time.
-        if (exportMoveInFlight) return
-        if (exportPickerOpen) return
-        exportPickerOpen = true
-        pendingExportNames = pendingNames
+        if (!ExportController.tryOpenPicker(pendingNames)) return
         val intent = android.content.Intent(
             android.content.Intent.ACTION_OPEN_DOCUMENT_TREE
         ).apply {
@@ -5334,8 +5814,7 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
             // Whatever the launch failure, the picker is not
             // open: the flag must not stay up and mute every
             // later pick for the process's lifetime.
-            exportPickerOpen = false
-            pendingExportNames = null
+            ExportController.pickerLaunchFailed()
             if (e is android.content.ActivityNotFoundException) {
                 android.widget.Toast.makeText(
                     this, "フォルダ選択を開けませんでした",
@@ -5397,11 +5876,10 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
             openExportFolderPicker(names)
             return
         }
-        if (exportMoveInFlight) return
+        if (!ExportController.tryBeginMove()) return
         val treeUri = android.net.Uri.parse(treeStr)
-        exportMoveInFlight = true
         refreshExportRunButton()
-        logFileExecutor.execute {
+        ExportController.logFileExecutor.execute {
             // The single source the report below is built
             // from, on every ending: ExportMove records into
             // it as files land, and the folder resolution
@@ -5453,7 +5931,7 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
                 DebugLog.log("export", "export move failed: ${e.javaClass.simpleName}")
             } finally {
                 runOnUiThread {
-                    exportMoveInFlight = false
+                    ExportController.finishMove()
                     if (progress.folderInvalid) {
                         // State first, before any UI work: the
                         // dead destination is cleared and its
@@ -5478,7 +5956,7 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
                     ).show()
                     // View work goes to the live instance, which
                     // may not be the one that started the move.
-                    val host = exportUiHost?.get()
+                    val host = ExportController.uiHost?.get()
                     if (host != null && !host.isDestroyed) {
                         host.onExportMoveFinished(
                             progress.folderInvalid, names, progress.movedNames.toList()
@@ -5490,7 +5968,7 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
     }
 
     /** The view side of a finished move, called on the live
-     * instance (see exportUiHost): refresh the export page if
+     * instance (see ExportController.uiHost): refresh the export page if
      * it is showing, and after an invalid folder re-open the
      * picker for what has not moved yet. */
     private fun onExportMoveFinished(
@@ -5606,6 +6084,16 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
         )
     }
 
+    /** The correction toast for a clear failure that
+     * surfaces after the summary toast already ran
+     * (deferred store operations). */
+    private fun toastPartialClearFailure() {
+        android.widget.Toast.makeText(
+            this, "一部のデータを削除できませんでした",
+            android.widget.Toast.LENGTH_SHORT,
+        ).show()
+    }
+
     /**
      * Run the checked categories of the clear-data page. Each
      * category is independent: the history category never
@@ -5618,8 +6106,78 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
         var clearFailed = false
         if (clearHistoryCheck.isChecked) {
             val cutoff = clearPeriod.cutoffMillis(System.currentTimeMillis())
-            historyStore.deleteSince(cutoff)
-            persistHistory()
+            // Queued until the store has loaded (SEN-17):
+            // clearing the pre-load store would delete
+            // nothing and the loaded entries would survive
+            // a clear the user asked for.
+            var historyClearRefused = false
+            val storesWereReady = storesReady
+            runWhenStoresReady {
+                if (historyWriteBlocked) {
+                    // The store's file could not be read, so a
+                    // merged delete cannot be computed. A FULL
+                    // clear needs no merge: delete the file and
+                    // its evacuated copy, then write the empty
+                    // store. A period clear is refused openly
+                    // (review round 3, SEC-2/SEN-3).
+                    if (cutoff == null) {
+                        if (!deleteStateFileWithCorruptCopy(HISTORY_FILE_NAME)) {
+                            if (storesWereReady) {
+                                historyClearRefused = true
+                            } else {
+                                // Deferred past the summary
+                                // toast: correct it here, like
+                                // the period refusal (round 6,
+                                // SEN-2).
+                                toastPartialClearFailure()
+                            }
+                        }
+                        historyWriteBlocked = false
+                        historyStore.deleteSince(null)
+                        historyPersistDirty = true
+                        writeHistoryNow()
+                    } else {
+                        historyClearRefused = true
+                        DebugLog.log("clear", "history period clear refused: store unreadable")
+                        if (!storesWereReady) {
+                            // Deferred past the summary toast
+                            // below: this toast is the correction
+                            // (review round 4, SEN-3). When the
+                            // op ran inline, the summary toast
+                            // carries the failure instead.
+                            android.widget.Toast.makeText(
+                                this, "履歴を削除できませんでした（読み込みに失敗しています）",
+                                android.widget.Toast.LENGTH_SHORT,
+                            ).show()
+                        }
+                    }
+                    return@runWhenStoresReady
+                }
+                historyStore.deleteSince(cutoff)
+                // A clear writes immediately, never through
+                // the debounce (PER-4): the deletion is the
+                // user's privacy action, not browsing noise.
+                historyPersistDirty = true
+                writeHistoryNow()
+                // A full clear also removes the evacuated
+                // corrupt copy, which holds the same history
+                // (review round 3, SEC-3). Period clears leave
+                // it: it is a set-aside of unreadable data, not
+                // part of the period's browsable history.
+                if (cutoff == null && !deleteCorruptCopy(HISTORY_FILE_NAME)) {
+                    if (storesWereReady) {
+                        historyClearRefused = true
+                    } else {
+                        // Deferred past the summary toast:
+                        // correct it here (round 7, SEN-2).
+                        toastPartialClearFailure()
+                    }
+                }
+            }
+            // An inline refusal lands in the summary toast
+            // (review round 4, SEN-3/SEC-5): without this,
+            // "削除しました" followed a refusal.
+            if (historyClearRefused) clearFailed = true
         }
         if (clearCookiesCheck.isChecked) {
             // deleteAllData and the cookie manager below only
@@ -5669,6 +6227,22 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
             if (!clearSiteSettingsStores()) clearFailed = true
         }
         if (clearTabsCheck.isChecked) {
+            // The tabs category is the user's explicit word
+            // that the saved session goes (review round 4,
+            // SEN-2/SEC-3): an unreadable session file is
+            // deleted outright here — the only place that
+            // happens; an ordinary last-tab close never
+            // touches a blocked file — and the evacuated
+            // corrupt copy goes in both cases, before the
+            // restart writes the fresh session.
+            if (tabSessionWriteBlocked) {
+                if (!deleteStateFileWithCorruptCopy(TAB_SESSION_FILE_NAME)) {
+                    clearFailed = true
+                }
+                tabSessionWriteBlocked = false
+            } else if (!deleteCorruptCopy(TAB_SESSION_FILE_NAME)) {
+                clearFailed = true
+            }
             // After the categories that still use the tabs,
             // before the log sweep: closing the panel can
             // still write out the session's last exports, and
@@ -5701,8 +6275,15 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
             // covers only the export files, and runs on the same
             // executor as the export writes so the two can
             // never interleave.
-            DebugLog.deleteLogFiles(this)
-            logFileExecutor.execute {
+            if (!DebugLog.deleteLogFiles(this)) {
+                // The barrier did not run within its bound:
+                // the files are still there. Say so via the
+                // clear's failure flag instead of claiming
+                // success (review round 3, SEC-5).
+                clearFailed = true
+                DebugLog.log("clear", "debug log delete timed out")
+            }
+            ExportController.logFileExecutor.execute {
                 // The recordings are the category's main target
                 // now. The same block also sweeps the two retired
                 // destinations -- exports left in the app's log
@@ -5845,8 +6426,12 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
                 switcher.visibility == View.VISIBLE
             if (activityResumed && (!switcherUp || thumbCapturePendingFor === prev)) {
                 if (thumbCapturePendingFor === prev) thumbCapturePendingFor = null
-                prev.captureThumbnail()
-                persistThumbnail(prev)
+                // An unchanged page is not recaptured (PER-10):
+                // the draw is main-thread work on every switch.
+                if (prev.thumbnailDirty) {
+                    prev.captureThumbnail()
+                    persistThumbnail(prev)
+                }
             }
             // Background tabs pause their WebView: onPause pauses
             // rendering, animations and media on a best-effort
@@ -6203,6 +6788,7 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
             if (thumbCapturePendingFor !== tab) return@post
             thumbCapturePendingFor = null
             if (!activityResumed || activeTab !== tab || !tabs.contains(tab)) return@post
+            if (!tab.thumbnailDirty) return@post
             tab.captureThumbnail()
             persistThumbnail(tab)
             refreshSwitcherCard(tab)
@@ -6639,19 +7225,26 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
         // The flag is NOT consumed here: an SPA that pushStates
         // without changing its title still adopts the current
         // title at that commit.
-        if (!tab.secret && tab.titleArrivedSinceCommit) {
-            val newest = historyStore.newest
-            if (newest != null && newest.title.isEmpty() &&
-                newest.url == tab.lastCommittedUrl &&
-                TitleAttribution.belongs(tab.titleUrl, newest.url) &&
-                tab.title.isNotEmpty()
-            ) {
-                historyStore.record(newest.url, tab.title, newest.visitedAtMillis)
-                persistHistory()
-                if (::historyPage.isInitialized &&
-                    historyPage.visibility == View.VISIBLE
+        // The fill queues until the stores have loaded
+        // (SEN-17): its guards re-read the tab and the store
+        // when it runs, and every guard fails closed, so a
+        // replay that arrives after the tab moved on fills
+        // nothing.
+        runWhenStoresReady {
+            if (!tab.secret && tab.titleArrivedSinceCommit) {
+                val newest = historyStore.newest
+                if (newest != null && newest.title.isEmpty() &&
+                    newest.url == tab.lastCommittedUrl &&
+                    TitleAttribution.belongs(tab.titleUrl, newest.url) &&
+                    tab.title.isNotEmpty()
                 ) {
-                    renderHistory()
+                    historyStore.record(newest.url, tab.title, newest.visitedAtMillis)
+                    persistHistory()
+                    if (::historyPage.isInitialized &&
+                        historyPage.visibility == View.VISIBLE
+                    ) {
+                        renderHistory()
+                    }
                 }
             }
         }
@@ -6673,47 +7266,79 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
         // that is the user's explicit act, like sharing. A
         // bookmark added there fills in on a later NORMAL
         // visit instead.
-        if (!tab.secret) {
-            val committed = tab.lastCommittedUrl
-            val entry = if (committed.isNotEmpty()) {
-                bookmarkStore.findByUrl(committed)
-            } else {
-                null
-            }
-            if (entry != null) {
-                if (entry.title.isEmpty() && tab.titleArrivedSinceCommit &&
-                    TitleAttribution.belongs(tab.titleUrl, committed) &&
-                    tab.title.isNotEmpty()
-                ) {
-                    val result = bookmarkStore.updateBookmark(
-                        entry.id, tab.title, entry.url, entry.folderId,
-                    )
-                    if (result is UpdateBookmarkResult.Updated) {
-                        persistBookmarks()
-                        if (::bookmarksPage.isInitialized &&
-                            bookmarksPage.visibility == View.VISIBLE
-                        ) {
-                            renderBookmarks()
+        // Queued until the stores have loaded, like the
+        // history fill above (SEN-17); the guards re-read
+        // live state when it runs and fail closed.
+        runWhenStoresReady {
+            if (!tab.secret) {
+                val committed = tab.lastCommittedUrl
+                val entry = if (committed.isNotEmpty()) {
+                    bookmarkStore.findByUrl(committed)
+                } else {
+                    null
+                }
+                if (entry != null) {
+                    if (entry.title.isEmpty() && tab.titleArrivedSinceCommit &&
+                        TitleAttribution.belongs(tab.titleUrl, committed) &&
+                        tab.title.isNotEmpty()
+                    ) {
+                        val result = bookmarkStore.updateBookmark(
+                            entry.id, tab.title, entry.url, entry.folderId,
+                        )
+                        if (result is UpdateBookmarkResult.Updated) {
+                            persistBookmarks()
+                            if (::bookmarksPage.isInitialized &&
+                                bookmarksPage.visibility == View.VISIBLE
+                            ) {
+                                renderBookmarks()
+                            }
                         }
                     }
-                }
-                val icon = tab.favicon
-                // An entry whose stored icon failed to decode
-                // this session is re-captured too: the atomic
-                // overwrite is its recovery path (a plain
-                // flagged entry is left alone).
-                if (icon != null && tab.faviconUrl == committed &&
-                    (!entry.hasFavicon || entry.url in faviconLoadFailed)
-                ) {
-                    // The flag is confirmed inside saveFavicon
-                    // once the file lands.
-                    saveFavicon(entry.id, committed, icon)
+                    val icon = tab.favicon
+                    // An entry whose stored icon failed to decode
+                    // this session is re-captured too: the atomic
+                    // overwrite is its recovery path (a plain
+                    // flagged entry is left alone).
+                    if (icon != null && tab.faviconUrl == committed &&
+                        (!entry.hasFavicon || entry.url in faviconLoadFailed)
+                    ) {
+                        // The flag is confirmed inside saveFavicon
+                        // once the file lands.
+                        saveFavicon(entry.id, committed, icon)
+                    }
                 }
             }
         }
     }
 
     override fun onPageCommitted(tab: BrowserTab, url: String) {
+        // A commit changes what the tab shows: its thumbnail
+        // is stale from here (PER-10).
+        tab.thumbnailDirty = true
+        // A new document resets the tab's JS-dialog flood
+        // state (SEN-386): a fresh page may ask again. The
+        // test is the same loadStartedSinceCommit the history
+        // recording below uses. What counts as "fresh" is
+        // JsDialogResetPolicy (review round 4, SEN-1): a
+        // user-initiated load or an origin change resets; a
+        // page-caused same-origin commit (self-reload,
+        // script navigation, query churn) carries the count
+        // over, so a page cannot launder its dialog count
+        // through reloads. (Round 3 compared against
+        // tab.currentUrl, which onPageStarted has already
+        // overwritten with the new URL by commit time, so
+        // nearly every commit took the reload branch and
+        // the state effectively never reset.)
+        if (tab.loadStartedSinceCommit) {
+            if (JsDialogResetPolicy.shouldReset(
+                    tab.lastLoadUserNav, tab.previousCommittedUrl, url
+                )
+            ) {
+                tab.jsDialogFlood.noteNavigation()
+            } else {
+                tab.jsDialogFlood.noteReload()
+            }
+        }
         // A commit is what the address bar vouches for: refresh
         // its indicators NOW (SEN-358), for every tab kind —
         // the history recording below is normal-tabs-only, but
@@ -6756,12 +7381,24 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
             committedUrl = url,
             newestHistoryUrl = historyStore.newest?.url,
         )
-        historyStore.record(url, title, System.currentTimeMillis())
-        persistHistory()
-        if (::historyPage.isInitialized &&
-            historyPage.visibility == View.VISIBLE
-        ) {
-            renderHistory()
+        // Every commit records a visit, same-document ones
+        // included (pushState / replaceState / fragment):
+        // the history keeps the full trail, as ordinary
+        // browsers do (owner decision, 2026-11-28, which
+        // also removed the entry cap — see HistoryStore).
+        // The record itself queues until the stores have
+        // loaded (SEN-17): the title is read NOW, while the
+        // tab's flags still describe this commit; only the
+        // store write waits.
+        val recordedAt = System.currentTimeMillis()
+        runWhenStoresReady {
+            historyStore.record(url, title, recordedAt)
+            persistHistory()
+            if (::historyPage.isInitialized &&
+                historyPage.visibility == View.VISIBLE
+            ) {
+                renderHistoryCoalesced()
+            }
         }
     }
 
@@ -7213,7 +7850,7 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
                 // at all. What cannot be controlled is the
                 // system DownloadManager's own redirect handling
                 // after the hand-off; that residual is recorded
-                // in REVIEW.md.
+                // in the design records.
                 val cookie = if (approved.ask.cookieAllowed) {
                     SecretProfile.downloadCookie(
                         approved.tab.webView, approved.ask.url,
@@ -7222,7 +7859,20 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
                 } else {
                     null
                 }
-                Downloads.enqueue(this, approved.ask.copy(cookie = cookie))
+                // The hand-off reports; the wording is the
+                // caller's (SEN-21).
+                when (val result = Downloads.enqueue(this, approved.ask.copy(cookie = cookie))) {
+                    is Downloads.EnqueueResult.Started ->
+                        android.widget.Toast.makeText(
+                            this, "ダウンロードを開始しました: ${result.fileName}",
+                            android.widget.Toast.LENGTH_SHORT
+                        ).show()
+                    Downloads.EnqueueResult.Failed ->
+                        android.widget.Toast.makeText(
+                            this, "ダウンロードを開始できませんでした",
+                            android.widget.Toast.LENGTH_LONG
+                        ).show()
+                }
             }
         }
         val dialog = android.app.AlertDialog.Builder(this)
@@ -7442,10 +8092,9 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQ_EXPORT_TREE) {
-            exportPickerOpen = false
-            val names = pendingExportNames
-            pendingExportNames = null
-            if (exportMoveInFlight) {
+            val outcome = ExportController.onPickerResult()
+            val names = outcome.names
+            if (outcome.droppedForMove) {
                 // A pick returning while a move copies through
                 // the current grant must not swap the
                 // destination under it: applying it would
@@ -7558,7 +8207,9 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
         val kind: PageFeaturePolicy.JsDialogKind?,
         val result: android.webkit.JsResult,
         var dialog: android.app.AlertDialog? = null,
-        var input: android.widget.EditText? = null
+        var input: android.widget.EditText? = null,
+        /** The flood policy's suppress option (SEN-386), when offered. */
+        var suppressCheck: android.widget.CheckBox? = null
     )
 
     private val pendingJsDialog = PendingSlot<PendingJsDialog>()
@@ -7613,6 +8264,29 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
             // offer below stays as the backstop.
             cancelJsResult(entry.result)
             DebugLog.log("jsdialog", "cancelled (another modal is pending: ${pendingModalKinds()}), secret=${entry.tab.secret}")
+            return
+        }
+        if (entry.kind != PageFeaturePolicy.JsDialogKind.BEFORE_UNLOAD &&
+            entry.tab.jsDialogFlood.shouldSuppress()
+        ) {
+            // The page is flooding dialogs, or the user told
+            // it to stop (SEN-386): answer unseen until the
+            // next navigation. beforeunload is exempt — it
+            // cannot loop on its own, and answering it unseen
+            // would decide a navigation for the user.
+            cancelJsResult(entry.result)
+            if (entry.tab.jsDialogFlood.claimHardCapNotice()) {
+                // Announced once per document (SEN-14):
+                // silent auto-suppression reads as a hung
+                // page; the user can still navigate away or
+                // close the tab.
+                android.widget.Toast.makeText(
+                    this,
+                    "このページのダイアログが多すぎるため、別のページへ移動するまで自動で閉じます",
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
+            }
+            DebugLog.log("jsdialog", "cancelled (dialog flood suppressed), secret=${entry.tab.secret}")
             return
         }
         if (!pendingJsDialog.offer(entry)) {
@@ -7672,11 +8346,28 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
             // go, and the cap is marked — a confirm's second
             // paragraph must not vanish into a 200-char cut.
             .setMessage(PageFeaturePolicy.dialogMessageText(message))
+        // The flood policy's escape hatch (SEN-386): from the
+        // second consecutive dialog on, the user can tell this
+        // page to stop asking. beforeunload never carries it
+        // (it is exempt from the policy entirely).
+        val flood = entry.tab.jsDialogFlood
+        val suppressCheck =
+            if (entry.kind != PageFeaturePolicy.JsDialogKind.BEFORE_UNLOAD &&
+                flood.offerSuppressOption()
+            ) {
+                android.widget.CheckBox(this).apply {
+                    text = "このページのダイアログを今後表示しない"
+                }.also { entry.suppressCheck = it }
+            } else {
+                null
+            }
         when (entry.kind) {
-            PageFeaturePolicy.JsDialogKind.ALERT ->
+            PageFeaturePolicy.JsDialogKind.ALERT -> {
                 builder.setPositiveButton("OK") { _, _ ->
                     answerJsDialog(entry, confirmed = true)
                 }
+                if (suppressCheck != null) builder.setView(suppressCheck)
+            }
             PageFeaturePolicy.JsDialogKind.CONFIRM -> {
                 builder.setPositiveButton("OK") { _, _ ->
                     answerJsDialog(entry, confirmed = true)
@@ -7684,6 +8375,7 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
                 builder.setNegativeButton("キャンセル") { _, _ ->
                     answerJsDialog(entry, confirmed = false)
                 }
+                if (suppressCheck != null) builder.setView(suppressCheck)
             }
             PageFeaturePolicy.JsDialogKind.BEFORE_UNLOAD -> {
                 // Confirming means LEAVING — the reverse of the
@@ -7722,7 +8414,15 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
                 )
                 input.setSelection(0, input.text.length)
                 entry.input = input
-                builder.setView(input)
+                if (suppressCheck != null) {
+                    val box = android.widget.LinearLayout(this)
+                    box.orientation = android.widget.LinearLayout.VERTICAL
+                    box.addView(input)
+                    box.addView(suppressCheck)
+                    builder.setView(box)
+                } else {
+                    builder.setView(input)
+                }
                 builder.setPositiveButton("OK") { _, _ ->
                     answerJsDialog(entry, confirmed = true)
                 }
@@ -7740,11 +8440,17 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
         val dialog = builder.create()
         entry.dialog = dialog
         dialog.show()
+        if (entry.kind != PageFeaturePolicy.JsDialogKind.BEFORE_UNLOAD) {
+            flood.notePresented()
+        }
     }
 
     /** Answer [entry]'s result once, if it is still this slot's. */
     private fun answerJsDialog(entry: PendingJsDialog, confirmed: Boolean) {
         if (pendingJsDialog.takeIf { it === entry } == null) return
+        if (entry.suppressCheck?.isChecked == true) {
+            entry.tab.jsDialogFlood.noteUserChoseSuppress()
+        }
         try {
             if (entry.kind == null) {
                 val promptResult = entry.result as android.webkit.JsPromptResult
@@ -8275,6 +8981,9 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
 
     override fun onPause() {
         activityResumed = false
+        // Flush the debounced history write (PER-4): the
+        // process may be killed while paused.
+        writeHistoryNow()
         // The visible tab pauses with the activity.
         activeTab?.webView?.onPause()
         super.onPause()
@@ -8294,7 +9003,7 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
         }
         // Become the instance export-move completions aim
         // their view work at (a move can outlive its starter).
-        exportUiHost = java.lang.ref.WeakReference(this)
+        ExportController.uiHost = java.lang.ref.WeakReference(this)
     }
 
     /**
@@ -8398,6 +9107,10 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
      */
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
         super.onConfigurationChanged(newConfig)
+        // A new size or orientation repaints every page at
+        // a new aspect: the thumbnails no longer match the
+        // viewports (review round 2, SEN-16).
+        for (t in tabs) t.thumbnailDirty = true
         if (::menuSheet.isInitialized && menuSheet.visibility == View.VISIBLE) hideMenu()
         if (::dtPanel.isInitialized) {
             // Clamp the CHOSEN height only. Applying it here
@@ -8459,6 +9172,12 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
     }
 
     override fun onStop() {
+        // Flush again here, not only in onPause (review
+        // round 2, SEN-6): a commit or title fill-in that
+        // lands while paused rearms the debounce, and the
+        // activity can be destroyed from stopped without
+        // another pause.
+        writeHistoryNow()
         activityStopped = true
         // Leaving the foreground ends the visible tab's
         // undecided popup too (SEC-151): its page's script
@@ -8466,6 +9185,11 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
         // decided later would open a tab over whatever the
         // user moved on to.
         activeTab?.expirePopupProbes()
+        // A pending JS dialog belongs to the foreground too:
+        // leaving retires it (audit run-4 hardening), so a
+        // background page's script is not left parked on an
+        // unanswered result.
+        activeTab?.let { retireJsDialog(it) }
         // The DevTools session is a live bridge into every tab; it
         // ends when the app leaves the foreground rather than
         // lingering in the background.
@@ -8474,7 +9198,13 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
     }
 
     override fun onDestroy() {
-        if (exportUiHost?.get() === this) exportUiHost = null
+        // The debounced history flush captures this Activity
+        // (PER-11): cancel it and flush synchronously, so a
+        // destroyed instance cannot write its stale store
+        // over a recreated instance's newer one.
+        mainHandler.removeCallbacks(historyPersistFlush)
+        if (historyPersistDirty) writeHistoryNow()
+        if (ExportController.uiHost?.get() === this) ExportController.uiHost = null
         // Full teardown: stop the stats loop, end the proxy, and
         // detach every WebView from its parent before destroying it
         // (a WebView destroyed while attached can leak its view tree

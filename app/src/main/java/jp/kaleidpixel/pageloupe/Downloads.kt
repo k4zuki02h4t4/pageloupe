@@ -4,7 +4,6 @@ import android.app.DownloadManager
 import android.content.Context
 import android.net.Uri
 import android.os.Environment
-import android.widget.Toast
 import java.io.File
 
 /**
@@ -58,7 +57,14 @@ object Downloads {
         val cookie: String? = null
     )
 
-    fun enqueue(ctx: Context, ask: Ask) {
+    /** The hand-off's outcome; the caller phrases it to the
+     * user (SEN-21: this object performs, it does not speak). */
+    sealed interface EnqueueResult {
+        data class Started(val fileName: String) : EnqueueResult
+        data object Failed : EnqueueResult
+    }
+
+    fun enqueue(ctx: Context, ask: Ask): EnqueueResult {
         try {
             val fileName = uniqueFileName(ask.fileName)
             val request = DownloadManager.Request(Uri.parse(ask.url))
@@ -81,19 +87,19 @@ object Downloads {
             }
             val dm = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
             dm.enqueue(request)
-            Toast.makeText(ctx, "ダウンロードを開始しました: $fileName", Toast.LENGTH_SHORT).show()
             // File names of secret-tab downloads stay out of the
             // debug log, like every other secret-tab datum.
             DebugLog.log(
                 "download",
                 "started: ${if (ask.secret) "<redacted>" else fileName}, secret=${ask.secret}"
             )
+            return EnqueueResult.Started(fileName)
         } catch (e: Exception) {
-            Toast.makeText(ctx, "ダウンロードを開始できませんでした", Toast.LENGTH_LONG).show()
             DebugLog.log(
                 "download",
                 "enqueue failed: ${e.javaClass.simpleName}, secret=${ask.secret}"
             )
+            return EnqueueResult.Failed
         }
     }
 

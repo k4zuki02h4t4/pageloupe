@@ -70,9 +70,10 @@ package jp.kaleidpixel.pageloupe
  * (1) A leftover record can mark a later successful
  * NEW-document commit of the same URL. Records live
  * until the next start or commit, so one left behind
- * by a load that never commits (stopped, or superseded
- * before its error page could commit), or recorded by
- * a subresource failure after its page's commit, is
+ * by a load that failed for real but never commits
+ * (superseded after its failure was recorded, before
+ * its error page could commit), or recorded by a
+ * subresource failure after its page's commit, is
  * still there when that URL is later opened directly —
  * and under the failure-before-start delivery order it
  * is indistinguishable from the new load's own failure.
@@ -96,6 +97,16 @@ package jp.kaleidpixel.pageloupe
  * the new-document branch and can adopt a verdict
  * after all; that narrow case is part of this
  * residual (r10).
+ * The stopped/superseded case that used to dominate
+ * this residual is closed since SEN-385 (v0.44.2):
+ * an aborted load reports ERROR_UNKNOWN and is not
+ * recorded at all (see recordError), so the record a
+ * replacing navigation's commit could adopt can now
+ * only come from a failure that really happened. The
+ * gate rests on Chromium mapping ERR_ABORTED to
+ * ERROR_UNKNOWN; the device procedure that would
+ * confirm the mapping is NEEDS-VALIDATION #1 of
+ * security-audit run-4.
  * (2) Fail-open — the error page shows the lock, as it
  * did before v0.43.0: a redirect chain whose failure is
  * recorded before its start callback is delivered loses
@@ -126,9 +137,20 @@ class ErrorPageTracker {
      * A load failed (onReceivedError). Only a main-frame
      * failure is the page's own: subresource calls are
      * ignored here, whatever the caller passed along.
+     *
+     * An aborted load is not recorded (SEN-385): a load
+     * that was stopped or superseded by a newer navigation
+     * reports ERROR_UNKNOWN (Chromium's ERR_ABORTED maps
+     * to it) and commits no error page of its own — the
+     * navigation that replaced it commits instead. Recording
+     * it left a record that the replacing load's commit of
+     * the same URL (possibly another origin's) then adopted,
+     * which on an http page suppressed the cleartext
+     * warning for a page that never failed.
      */
-    fun recordError(url: String?, isForMainFrame: Boolean) {
+    fun recordError(url: String?, isForMainFrame: Boolean, errorCode: Int) {
         if (!isForMainFrame) return
+        if (errorCode == ERROR_CODE_UNKNOWN) return
         if (url != null) mainFrameErrorUrl = url
     }
 
@@ -174,6 +196,10 @@ class ErrorPageTracker {
     // doc), so a finish must never retire a record.
 
     companion object {
+        /** Mirrors WebViewClient.ERROR_UNKNOWN: the code an
+         * aborted (stopped or superseded) load reports. */
+        const val ERROR_CODE_UNKNOWN = -1
+
         /** Cap on the SSL record set (see the class doc). */
         const val MAX_SSL_RECORDS = 32
 

@@ -73,7 +73,14 @@ class QueuedFileWriter(
             if (hasWritten && content == lastWritten) return@execute
             try {
                 if (content == null) {
-                    file.delete()
+                    // A failed delete must not be recorded as
+                    // done (SEN-16): with the state recorded, a
+                    // later identical (null) submission would
+                    // dedupe-skip and the file would stay.
+                    // Deleting an absent file is success.
+                    if (!file.delete() && file.exists()) {
+                        throw java.io.IOException("delete failed: ${file.name}")
+                    }
                 } else {
                     AtomicFileWrite.write(file) { w -> w.write(content) }
                 }

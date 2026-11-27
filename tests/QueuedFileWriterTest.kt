@@ -10,7 +10,7 @@ import java.util.concurrent.TimeUnit
 // files — a later submission must never be overwritten by an
 // earlier queued one, superseded submissions are skipped, and
 // flush() guarantees the newest state is on disk.
-// Run via tests/run_tests.sh.
+// Run via the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0
@@ -54,6 +54,29 @@ fun main() {
         writer.submit { "back" }
         writer.flush()
         check("write after delete recreates", file.readText() == "back")
+
+        // A failed delete is reported and NOT recorded as
+        // done (SEN-16): the same (null) submission again
+        // must retry the delete, not dedupe-skip it. The
+        // delete is made to fail by aiming the writer at a
+        // non-empty directory (delete() refuses, exists()
+        // stays true).
+        val dirTarget = File(dir, "state-dir")
+        dirTarget.mkdir()
+        File(dirTarget, "child").writeText("x")
+        var deleteErrors = 0
+        val writerDir = QueuedFileWriter(dirTarget, executor) { deleteErrors++ }
+        writerDir.submit { null }
+        writerDir.flush()
+        check("failed delete is reported", deleteErrors == 1)
+        check("failed delete leaves the target", dirTarget.isDirectory)
+        File(dirTarget, "child").delete()
+        writerDir.submit { null }
+        writerDir.flush()
+        check(
+            "the retried delete lands",
+            !dirTarget.exists() && deleteErrors == 1,
+        )
 
         // The regression this class exists for: a "final" state
         // submitted after a pile of stale ones is what survives

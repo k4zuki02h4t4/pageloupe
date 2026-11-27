@@ -4,7 +4,7 @@ import jp.kaleidpixel.pageloupe.PageFeaturePolicy
 
 // JVM tests for PageFeaturePolicy: the pure rules behind
 // downloads and page permission requests (SEN-25). Run via
-// tests/run_tests.sh.
+// the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0

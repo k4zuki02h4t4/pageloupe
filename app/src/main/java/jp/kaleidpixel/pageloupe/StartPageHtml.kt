@@ -11,7 +11,7 @@ package jp.kaleidpixel.pageloupe
  * loads. The DevTools recorder excludes only the start page's
  * own Document load and records everything else on the tab's
  * stream, on the premise that the start page emits nothing
- * else (see isInternalDocumentUrl and REVIEW.md). Adding an
+ * else (see isInternalDocumentUrl and the design records). Adding an
  * external reference here would silently put the start page's
  * own traffic into the recordings. The JVM tests
  * (tests/StartPageHtmlTest.kt) pin the absence of

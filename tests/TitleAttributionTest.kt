@@ -6,7 +6,7 @@ import jp.kaleidpixel.pageloupe.TitleAttribution
 // drives from its title/commit callbacks: which URL the tab's
 // current title belongs to (the share sheet pairs a title
 // with a URL only when this says they belong together).
-// Run via tests/run_tests.sh.
+// Run via the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0

@@ -29,10 +29,19 @@ import java.io.InputStream
  *   is classified here (access loss invalidates the folder,
  *   anything else fails every present file at once), so the
  *   whole counting rule lives in this one place.
- * - The original is deleted only after its copy completes.
- *   If that delete fails the file still counts as moved (the
- *   copy is complete); the caller is told via
- *   [onOriginalRemains] and the leftover stays listed.
+ * - The original is deleted only after its copy completes
+ *   AND the destination's reported length agrees with the
+ *   source's (SEN-22): a copy operation that reports success
+ *   is not proof the bytes all landed. A destination that
+ *   cannot report a length (negative) is taken on the copy's
+ *   word — verification where the provider supports it,
+ *   never a new failure mode where it does not. A mismatch
+ *   is a per-file failure: the partial destination is
+ *   discarded and the original stays.
+ *   If the delete itself fails the file still counts as
+ *   moved (the copy is complete and verified); the caller
+ *   is told via [onOriginalRemains] and the leftover stays
+ *   listed.
  * - Bookkeeping for a completed copy lands before any
  *   callback runs. All counts live in a caller-kept [Progress]:
  *   an Error that propagates out of the loop loses the
@@ -49,6 +58,11 @@ object ExportMove {
 
         /** Streams [input] into the document [handle] refers to. Throws on failure. */
         fun copy(handle: Any, input: InputStream)
+
+        /** The length the destination reports for the
+         * document [handle] refers to, or a negative value
+         * when the destination cannot say (SEN-22). */
+        fun writtenLength(handle: Any): Long
 
         /** Best-effort delete of a created document (a partial
          * copy). Returns whether it is gone. */
@@ -153,6 +167,7 @@ object ExportMove {
                     progress.skipped++
                     continue
                 }
+                val sourceLength = file.length()
                 val input = try {
                     openSource(file)
                 } catch (e: Exception) {
@@ -167,6 +182,29 @@ object ExportMove {
                         val h = target.create(name, ExportSelection.mimeTypeOf(name))
                         handle = h
                         target.copy(h, inp)
+                    }
+                    // Verify before the original is deleted
+                    // (SEN-22, class doc): a reported length
+                    // that disagrees means the copy did not
+                    // all land, whatever copy() said.
+                    val destLength = target.writtenLength(handle!!)
+                    // A reported 0 is "cannot report", not a
+                    // mismatch (review round 2, SEN-13):
+                    // cloud document providers answer
+                    // COLUMN_SIZE with 0 or a stale value for
+                    // a just-written file, and failing every
+                    // export to such a provider would make
+                    // the feature unusable there while the
+                    // original is still safe. Only a positive
+                    // length that disagrees is evidence the
+                    // copy did not land. (A genuinely empty
+                    // source reports 0 == 0 and passes either
+                    // way.)
+                    if (destLength > 0 && destLength != sourceLength) {
+                        failure = java.io.IOException(
+                            "export copy length mismatch for $name:" +
+                                " source $sourceLength, destination $destLength"
+                        )
                     }
                 } catch (e: Throwable) {
                     failure = e

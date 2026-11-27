@@ -29,7 +29,6 @@ intent-filter
 manifest
 meta-data
 permission
-provider
 queries
 service
 uses-permission

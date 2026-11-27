@@ -5,7 +5,7 @@ import jp.kaleidpixel.pageloupe.RecordedLogsPolicy
 // JVM tests for the recordings folder's retention policy:
 // which recordings the prune drops once the folder grows past
 // its cap. Pure list arithmetic; the folder wiring is covered
-// on device. Run via tests/run_tests.sh.
+// on device. Run via the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0

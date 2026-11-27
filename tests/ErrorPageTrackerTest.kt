@@ -12,6 +12,9 @@ import jp.kaleidpixel.pageloupe.ErrorPageTracker
 // the main-frame filter is enforced by the tracker
 // itself, and the SSL set's bounds can never evict the
 // main frame's authoritative record.
+/** A real failure's code (host lookup), for recordError calls. */
+private const val ERR = -2
+
 fun main() {
     var failures = 0
     var checks = 0
@@ -32,7 +35,7 @@ fun main() {
     // later, successful load) is not marked.
     run {
         val t = ErrorPageTracker()
-        t.recordError(a, isForMainFrame = true)
+        t.recordError(a, true, ERR)
         check("main-frame failure marks its commit", t.consumeAtCommit(a))
         check("consumed record does not mark again", !t.consumeAtCommit(a))
     }
@@ -58,7 +61,7 @@ fun main() {
     // main frame's failure must not displace its record.
     run {
         val t = ErrorPageTracker()
-        t.recordError(a, isForMainFrame = true)
+        t.recordError(a, true, ERR)
         t.recordSslError(s)
         check("later subresource record keeps the main frame's", t.consumeAtCommit(a))
     }
@@ -80,7 +83,7 @@ fun main() {
     run {
         val t = ErrorPageTracker()
         t.recordSslError(a)
-        t.recordError(b, isForMainFrame = true)
+        t.recordError(b, true, ERR)
         check("main-frame slot is independent of ssl records", t.consumeAtCommit(b))
     }
 
@@ -89,7 +92,7 @@ fun main() {
     // must keep the record.
     run {
         val t = ErrorPageTracker()
-        t.recordError(a, isForMainFrame = true)
+        t.recordError(a, true, ERR)
         check("start for the same url drops nothing", !t.onLoadStarted(a))
         check("record survives its own start", t.consumeAtCommit(a))
     }
@@ -118,7 +121,7 @@ fun main() {
     // recorded, whatever the caller did.
     run {
         val t = ErrorPageTracker()
-        t.recordError(s, isForMainFrame = false)
+        t.recordError(s, false, ERR)
         check("subresource call is not recorded", !t.consumeAtCommit(s))
     }
 
@@ -126,7 +129,7 @@ fun main() {
     // load's records (both provenances) and reports it.
     run {
         val t = ErrorPageTracker()
-        t.recordError(a, isForMainFrame = true)
+        t.recordError(a, true, ERR)
         t.recordSslError(s)
         check("start for another url reports the drop", t.onLoadStarted(b))
         check("main-frame record retired at start", !t.consumeAtCommit(a))
@@ -163,7 +166,7 @@ fun main() {
     // after the finish, for both provenances.
     run {
         val t = ErrorPageTracker()
-        t.recordError(a, isForMainFrame = true)
+        t.recordError(a, true, ERR)
         check("error commit after the finish still marks", t.consumeAtCommit(a))
         val t2 = ErrorPageTracker()
         t2.recordSslError(a)
@@ -175,7 +178,7 @@ fun main() {
     // frame's authoritative record survives.
     run {
         val t = ErrorPageTracker()
-        t.recordError(a, isForMainFrame = true)
+        t.recordError(a, true, ERR)
         repeat(ErrorPageTracker.MAX_SSL_RECORDS + 8) { i ->
             t.recordSslError("https://sub$i.example/")
         }
@@ -219,9 +222,28 @@ fun main() {
     // Null records are ignored.
     run {
         val t = ErrorPageTracker()
-        t.recordError(null, isForMainFrame = true)
+        t.recordError(null, true, ERR)
         t.recordSslError(null)
         check("null records mark nothing", !t.consumeAtCommit(a))
+    }
+
+    // An aborted load is not recorded (SEN-385): a stopped
+    // or superseded load reports ERROR_UNKNOWN and commits
+    // no error page, so its record must not be there for
+    // the replacing navigation's commit of the same URL.
+    run {
+        val t = ErrorPageTracker()
+        t.recordError(a, true, ErrorPageTracker.ERROR_CODE_UNKNOWN)
+        check("an aborted load marks nothing", !t.consumeAtCommit(a))
+    }
+
+    // A real failure recorded after an abort still marks:
+    // the abort gate drops only the abort's own record.
+    run {
+        val t = ErrorPageTracker()
+        t.recordError(a, true, ErrorPageTracker.ERROR_CODE_UNKNOWN)
+        t.recordError(a, true, ERR)
+        check("a real failure after an abort still marks", t.consumeAtCommit(a))
     }
 
     println("ErrorPageTrackerTest: $checks checks, $failures failures")

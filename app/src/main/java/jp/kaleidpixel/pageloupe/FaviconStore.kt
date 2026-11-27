@@ -3,7 +3,6 @@ package jp.kaleidpixel.pageloupe
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import java.io.File
-import java.io.FileOutputStream
 import java.io.IOException
 import java.security.MessageDigest
 
@@ -85,21 +84,13 @@ object FaviconStore {
     fun save(dir: File, url: String, bitmap: Bitmap) {
         dir.mkdirs()
         val target = fileFor(dir, url)
-        val tmp = File(dir, target.name + ".tmp")
-        try {
-            FileOutputStream(tmp).use { out ->
-                if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)) {
-                    throw IOException("compress failed: ${target.name}")
-                }
+        // The shared atomic write (SEN-16): tmp + fsync +
+        // rename + cleanup exist exactly once, in
+        // AtomicFileWrite.
+        AtomicFileWrite.writeStream(target) { out ->
+            if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)) {
+                throw IOException("compress failed: ${target.name}")
             }
-            if (!tmp.renameTo(target)) {
-                throw IOException("rename failed: ${target.name}")
-            }
-        } catch (e: Throwable) {
-            if (tmp.exists() && !tmp.delete()) {
-                e.addSuppressed(IOException("temp not deleted: ${tmp.name}"))
-            }
-            throw e
         }
     }
 

@@ -11,7 +11,7 @@ import java.io.InputStream
 // never the destination's loss, access loss stops the move),
 // the partial-copy cleanup, and the outcome counts. The SAF
 // wiring behind the real Target is covered on device.
-// Run via tests/run_tests.sh.
+// Run via the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0
@@ -31,6 +31,8 @@ private class FakeTarget : ExportMove.Target {
     var createError: (String) -> Throwable? = { null }
     var copyError: (String) -> Throwable? = { null }
     var discardResult = true
+    /** Overrides the reported destination length (SEN-22). */
+    var lengthOverride: (String) -> Long? = { null }
 
     override fun create(name: String, mimeType: String): Any {
         createError(name)?.let { throw it }
@@ -42,6 +44,12 @@ private class FakeTarget : ExportMove.Target {
         val name = handle as String
         copyError(name)?.let { throw it }
         copied[name] = input.readBytes().toString(Charsets.UTF_8)
+    }
+
+    override fun writtenLength(handle: Any): Long {
+        val name = handle as String
+        lengthOverride(name)?.let { return it }
+        return copied[name]?.toByteArray(Charsets.UTF_8)?.size?.toLong() ?: -1L
     }
 
     override fun discard(handle: Any): Boolean {
@@ -264,6 +272,7 @@ fun main() {
                 override fun copy(handle: Any, input: InputStream) {
                     throw IOException("write died")
                 }
+                override fun writtenLength(handle: Any): Long = -1L
                 override fun discard(handle: Any): Boolean {
                     throw RuntimeException("discard broke")
                 }
@@ -342,6 +351,45 @@ fun main() {
                 resolveTarget = { resolved = true; FakeTarget() }
             )
             check("nothing present skips resolve", !resolved && out.skipped == 1)
+        }
+
+        // SEN-22: a destination reporting a different length
+        // than the source fails the file: the original stays
+        // and the partial destination is discarded.
+        run {
+            val f1 = recording(dir, "devtools-console-len.json", "12345")
+            val target = FakeTarget()
+            target.lengthOverride = { 3L }
+            val out = ExportMove.run(listOf(f1.name), dir, { target })
+            check("length mismatch fails the file",
+                out.failed == 1 && out.moved == 0)
+            check("length mismatch keeps the original", f1.isFile)
+            check("length mismatch discards the destination",
+                target.discarded == listOf<Any>(f1.name))
+        }
+
+        // SEN-22: a destination that cannot report a length
+        // (negative) is taken on the copy's word.
+        run {
+            val f1 = recording(dir, "devtools-console-nolen.json", "12345")
+            val target = FakeTarget()
+            target.lengthOverride = { -1L }
+            val out = ExportMove.run(listOf(f1.name), dir, { target })
+            check("unreported length still moves",
+                out.moved == 1 && out.failed == 0 && !f1.exists())
+        }
+
+        // Review round 2 (SEN-13): a destination reporting
+        // 0 for a non-empty source is also "cannot report"
+        // (cloud providers answer COLUMN_SIZE with 0 for a
+        // just-written file), not a mismatch.
+        run {
+            val f1 = recording(dir, "devtools-console-zerolen.json", "12345")
+            val target = FakeTarget()
+            target.lengthOverride = { 0L }
+            val out = ExportMove.run(listOf(f1.name), dir, { target })
+            check("zero reported length still moves",
+                out.moved == 1 && out.failed == 0 && !f1.exists())
         }
 
         // A resolver Error propagates and marks the move

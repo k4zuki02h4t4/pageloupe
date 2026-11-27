@@ -113,4 +113,19 @@ object TabSessionCodec {
         val active = root.optInt("active", 0).coerceIn(0, tabs.size - 1)
         return SavedSession(tabs, active)
     }
+
+    /**
+     * Whether [json] is corrupt AT THE ROOT (not a JSON
+     * object, a format version this build does not write,
+     * or no tabs array) — as opposed to a well-formed
+     * document that merely holds no savable tabs, which
+     * [decode] also answers with null. The caller
+     * evacuates a root-corrupt file instead of letting
+     * the next save overwrite it unseen (SEN-2).
+     */
+    fun isCorruptDocument(json: String): Boolean {
+        val root = runCatching { JSONObject(json) }.getOrNull() ?: return true
+        if (root.optInt("v", -1) != FORMAT_VERSION) return true
+        return root.optJSONArray("tabs") == null
+    }
 }

@@ -61,8 +61,18 @@ enum class HistoryPeriod {
  * - A load of the same URL as the newest entry refreshes that
  *   entry's title and timestamp instead of stacking a duplicate
  *   row (reloads and late title fixes stay one row).
- * - The list is capped at [MAX_ENTRIES]; the oldest entries fall
- *   off the end.
+ * - There is no cap on the number of entries (owner
+ *   decision, 2026-11-28, aligning with ordinary browsers:
+ *   every visit is kept, including same-document commits —
+ *   pushState and friends record like any other visit).
+ *   The earlier design capped the list at 5000 and replaced
+ *   the newest entry on a same-document commit so one page
+ *   looping pushState could not flush the rest of the
+ *   history at the cap (SEN-387); with the cap gone the
+ *   replacement went with it. The accepted residual is
+ *   the mirror image: a page looping URL changes grows
+ *   the file by one entry per change, the same exposure
+ *   any browser's history has to visit count.
  * - Deletion by period removes entries at or after the cutoff
  *   and never touches anything else — open tabs and the saved
  *   tab session are separate stores (owner decision, 2026-11-21).
@@ -93,9 +103,9 @@ class HistoryStore {
      * Both fields are page-controlled, so their size is capped
      * here: a URL longer than [MAX_URL_LENGTH] is not recorded
      * at all (the tab session applies the same cap), and the
-     * title is truncated to [MAX_TITLE_LENGTH]. Without this, a
-     * page could grow the history file — and every full-file
-     * rewrite of it — without bound via pushState.
+     * title is truncated to [MAX_TITLE_LENGTH]. The per-entry
+     * bound stays even though the entry count is uncapped:
+     * one entry must never be able to dominate the file.
      */
     fun record(url: String, title: String, visitedAtMillis: Long) {
         if (url.length > MAX_URL_LENGTH) return
@@ -106,7 +116,6 @@ class HistoryStore {
         entries.addFirst(
             HistoryEntry(url, title.take(MAX_TITLE_LENGTH), visitedAtMillis),
         )
-        while (entries.size > MAX_ENTRIES) entries.removeLast()
     }
 
     /**
@@ -173,8 +182,6 @@ class HistoryStore {
     fun toJson(): String = toJson(entries)
 
     companion object {
-        const val MAX_ENTRIES = 5000
-
         /** URLs longer than this are not recorded (cf. TabSessionCodec). */
         const val MAX_URL_LENGTH = 2048
 
@@ -199,22 +206,45 @@ class HistoryStore {
         /**
          * Parse a document written by [toJson]. Tolerant by
          * design: a corrupt file yields an empty store rather
-         * than a crash, malformed entries are skipped, and the
-         * cap is re-applied. Entries keep their file order
-         * (newest first).
+         * than a crash and malformed entries are skipped.
+         * Entries keep their file order (newest first).
          */
-        fun fromJson(json: String): HistoryStore {
+        fun fromJson(json: String): HistoryStore =
+            parseDocument(json) ?: HistoryStore()
+
+        /**
+         * Parse a document written by [toJson], or null when
+         * the document is corrupt AT THE ROOT: not a JSON
+         * object, a format version this build does not write,
+         * or no entries array. Entry-level damage is not
+         * corruption — malformed entries are skipped, as
+         * [fromJson] documents. The distinction is what lets
+         * the caller evacuate a root-corrupt file instead of
+         * letting the next save silently overwrite the only
+         * copy of the data (SEN-2).
+         */
+        fun parseDocument(json: String): HistoryStore? {
+            // Exception-only on purpose (review round 3,
+            // PER-2): runCatching would also catch an
+            // OutOfMemoryError and report a huge but valid
+            // file as corrupt, evacuating it. An Error
+            // propagates to the loader, which treats it as a
+            // read failure (writes blocked, file untouched).
+            val root = try {
+                JSONObject(json)
+            } catch (_: Exception) {
+                return null
+            }
+            if (root.optInt("v", -1) != FORMAT_VERSION) return null
+            val arr = root.optJSONArray("entries") ?: return null
             val store = HistoryStore()
-            val root = runCatching { JSONObject(json) }.getOrNull() ?: return store
-            val arr = root.optJSONArray("entries") ?: return store
             // The file is newest-first; appending in file order
-            // rebuilds that order, and the cap keeps the newest.
+            // rebuilds that order.
             // Entries are re-validated on the way in (a web link
             // within the recording caps), so a damaged or
             // hand-edited file cannot resurrect values the
             // recorder itself would never have written.
             for (i in 0 until arr.length()) {
-                if (store.entries.size >= MAX_ENTRIES) break
                 val obj = arr.optJSONObject(i) ?: continue
                 val url = obj.optString("u", "")
                 val at = obj.optLong("at", 0L)

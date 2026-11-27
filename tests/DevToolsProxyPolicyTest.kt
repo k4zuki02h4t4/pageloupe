@@ -4,7 +4,7 @@ import jp.kaleidpixel.pageloupe.DevToolsProxyPolicy
 
 // JVM tests for the DevTools proxy's relay pins (audit
 // hardening): which path shape and which Host header the
-// proxy accepts. Run via tests/run_tests.sh.
+// proxy accepts. Run via the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0

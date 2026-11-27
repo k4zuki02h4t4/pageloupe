@@ -7,7 +7,7 @@ import jp.kaleidpixel.pageloupe.PopupProbeRegistry
 // old probe back, retire reports whether the probe was still
 // registered (the only state in which a late callback may
 // act), and expire hands the pending probe back exactly
-// once. Run via tests/run_tests.sh.
+// once. Run via the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0

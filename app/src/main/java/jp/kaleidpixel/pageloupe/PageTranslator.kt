@@ -1,7 +1,9 @@
 package jp.kaleidpixel.pageloupe
 
+import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import com.google.mlkit.common.MlKit
 import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.common.model.RemoteModelManager
 import com.google.mlkit.nl.languageid.LanguageIdentification
@@ -329,7 +331,34 @@ class PageTranslator(
                 host.toast(TranslateNotice.NO_TEXT)
                 return@evaluateJavascript
             }
+            ensureMlKitInitialized(tab.webView.context)
             detectAndTranslate(gen, work, extracted.lang, extracted.groups)
+        }
+    }
+
+    /**
+     * ML Kit's own startup provider is removed from the
+     * merged manifest (PER-3: it ran at every process start
+     * although translation is the only ML Kit use), so the
+     * SDK is initialized here instead — once per process,
+     * at the first run that actually reaches the ML Kit
+     * calls. Only a successful attempt is marked done
+     * (review round 2, SEN-17): a transient failure must
+     * not disable translation until the process restarts.
+     * Retries stay bounded by the user starting another
+     * translation run — this is called once per run, never
+     * in a loop.
+     */
+    private fun ensureMlKitInitialized(context: Context) {
+        if (mlKitInitialized) return
+        synchronized(PageTranslator::class.java) {
+            if (mlKitInitialized) return
+            try {
+                MlKit.initialize(context.applicationContext)
+                mlKitInitialized = true
+            } catch (e: Exception) {
+                DebugLog.log("translate", "ML Kit init failed: ${e.javaClass.simpleName}")
+            }
         }
     }
 
@@ -1232,6 +1261,10 @@ class PageTranslator(
          * keep the on-device engine busy without flooding it
          * with a large page's worth of tasks at once. */
         private const val MAX_IN_FLIGHT = 8
+
+        /** Set once [PageTranslator.ensureMlKitInitialized]
+         * has run (PER-3). */
+        @Volatile private var mlKitInitialized = false
 
         // SEN-1101: the first-load gate shared by every
         // run in the process (see FirstLoadGate).

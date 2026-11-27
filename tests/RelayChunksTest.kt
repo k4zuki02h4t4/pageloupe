@@ -11,7 +11,7 @@ import java.io.OutputStream
 // relay loop, extracted so the ordering contract is pinned
 // here — forward (write + flush) first, observe after, and a
 // chunk whose forwarding failed is never observed. Run via
-// tests/run_tests.sh.
+// the runUnitTests Gradle task.
 
 private var failures = 0
 private var checks = 0
@@ -60,7 +60,7 @@ fun main() {
     // Order: every chunk is written and flushed before it is
     // observed, and the observer sees exactly the input bytes.
     run {
-        val data = pattern(20_000) // 8192 + 8192 + 3616
+        val data = pattern(70_000) // 32768 + 32768 + 4464 at the PER-7 chunk size
         val events = mutableListOf<String>()
         val out = RecordingOutput(events)
         val observed = ByteArrayOutputStream()
@@ -71,9 +71,9 @@ fun main() {
         check(
             "write/flush precede observe per chunk",
             events == listOf(
-                "W8192", "L", "F8192",
-                "W8192", "L", "F8192",
-                "W3616", "L", "F3616"
+                "W32768", "L", "F32768",
+                "W32768", "L", "F32768",
+                "W4464", "L", "F4464"
             )
         )
         check("observed bytes equal input", observed.toByteArray().contentEquals(data))
@@ -137,8 +137,8 @@ fun main() {
         }
         check(
             "observer failure: first chunk forwarded first",
-            events == listOf("W8192", "L") &&
-                out.bytes.toByteArray().contentEquals(data.copyOf(8192))
+            events == listOf("W20000", "L") &&
+                out.bytes.toByteArray().contentEquals(data)
         )
     }
 
