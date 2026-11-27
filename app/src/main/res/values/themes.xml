@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/surface</item>
+        <!-- Edge to edge: both system bars are transparent and the app's own
+             white background shows through. The light-bar items make the OS
+             draw its icons dark on that light background. Declaring this in
+             the theme (like CallSeal does) is what makes it apply reliably;
+             setting the appearance at runtime in onCreate did not stick. -->
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+    </style>
+</resources>

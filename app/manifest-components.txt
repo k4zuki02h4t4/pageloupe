@@ -1,0 +1,12 @@
+# The components the shipped APK's merged manifest may declare
+# (activity / activity-alias / service / receiver / provider),
+# one per line. build.sh asserts the shipped set equals this
+# list exactly: a library update or a manifest edit that adds
+# or drops a component fails the build until this file is
+# updated in the same commit, so the change is a reviewed act
+# rather than a silent merge result. Sorted order does not
+# matter (the gate sorts both sides).
+.MainActivity
+com.google.android.gms.common.api.GoogleApiActivity
+com.google.mlkit.common.internal.MlKitComponentDiscoveryService
+com.google.mlkit.common.internal.MlKitInitProvider

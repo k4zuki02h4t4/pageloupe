@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The browsing history and the saved tab session (which holds
+  secret tabs' URLs) must not leave the device: excluded from
+  both cloud backup and device-to-device transfer. The tab
+  thumbnails are page screenshots and get the same exclusion. allowBackup
+  is already false, but on targetSdk 31+ that alone does not
+  stop device transfer — these rules close that side. The
+  transfer side also excludes the WebView data (cookies and
+  storage of every profile live under app_webview/) and the
+  recorded and exported DevTools logs and the debug logs,
+  which can carry the same URLs and payloads as the history
+  itself.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="history.json" />
+        <exclude domain="file" path="tab-session.json" />
+        <exclude domain="file" path="bookmarks.json" />
+        <exclude domain="file" path="favicons/" />
+        <exclude domain="file" path="thumbnails/" />
+        <exclude domain="file" path="logs/" />
+        <exclude domain="file" path="console-logs/" />
+        <!-- Mirrored from device-transfer (audit hardening):
+             if allowBackup is ever enabled, the cloud side must
+             not become the one path the WebView data and the
+             external log copies can still leave by. -->
+        <exclude domain="root" path="app_webview/" />
+        <exclude domain="external" path="logs/" />
+        <exclude domain="external" path="console-logs/" />
+        <!-- The ML Kit datatransport event store (SEC-10):
+             it can hold translation language codes, including
+             from secret tabs, and gets the same exclusion on
+             both sides (run-3 hardening). -->
+        <exclude domain="database" path="com.google.android.datatransport.events" />
+        <exclude domain="database" path="com.google.android.datatransport.events-journal" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="history.json" />
+        <exclude domain="file" path="tab-session.json" />
+        <exclude domain="file" path="bookmarks.json" />
+        <exclude domain="file" path="favicons/" />
+        <exclude domain="file" path="thumbnails/" />
+        <exclude domain="file" path="logs/" />
+        <exclude domain="file" path="console-logs/" />
+        <exclude domain="root" path="app_webview/" />
+        <exclude domain="external" path="logs/" />
+        <exclude domain="external" path="console-logs/" />
+        <exclude domain="database" path="com.google.android.datatransport.events" />
+        <exclude domain="database" path="com.google.android.datatransport.events-journal" />
+    </device-transfer>
+</data-extraction-rules>

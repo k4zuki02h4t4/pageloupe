@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The single source of truth for the app palette. Role names follow
+     the Material Design 3 colour scheme; the values are this app's
+     blue-seeded scheme. Kotlin reads these through Colors.load();
+     drawables and the theme reference them as @color/. The dark
+     palette is the values-night/ override of this file, with the
+     same role set. -->
+<resources>
+    <color name="primary">#0B57D0</color>
+    <color name="primary_container">#D3E3FD</color>
+    <color name="on_surface">#1F1F1F</color>
+    <color name="on_surface_variant">#5F6368</color>
+    <color name="surface">#FFFFFF</color>
+    <color name="surface_container_low">#F8F9FA</color>
+    <color name="surface_container">#F0F3F8</color>
+    <color name="surface_container_high">#E8EAED</color>
+    <color name="outline">#80868B</color>
+    <color name="outline_variant">#DADCE0</color>
+    <color name="error">#B3261E</color>
+    <color name="scrim">#66000000</color>
+    <!-- App-specific roles below the MD3 scheme roles. -->
+    <color name="icon">#3C4043</color>
+    <color name="warn">#B06000</color>
+    <color name="card_active">#E8F0FE</color>
+    <color name="ic_launcher_bg">#D9C1FE</color>
+</resources>

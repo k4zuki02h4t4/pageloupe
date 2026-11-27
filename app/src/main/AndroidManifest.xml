@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="jp.kaleidpixel.pageloupe">
+
+    <!-- androidx.core 1.9.0 (vendored for ML Kit, see libs/README.md)
+         declares this signature permission for its receiver
+         registration compat path. The name is the library's
+         ${applicationId} placeholder resolved to this package. -->
+    <permission
+        android:name="jp.kaleidpixel.pageloupe.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="jp.kaleidpixel.pageloupe.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- No app code uses this directly, but Chromium's WebView
+         needs it for its network-change notifier: without it,
+         navigator.onLine and online/offline events in pages stop
+         reflecting reality. It is a normal
+         (auto-granted) permission. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Declared so pages can be granted camera/microphone
+         (getUserMedia) after the runtime prompt and the in-app
+         per-site confirmation. The app itself never uses
+         either outside a page's granted request. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- No app code uses this directly, but Chromium's media stack
+         requires the embedder to hold it (together with RECORD_AUDIO)
+         for WebRTC audio capture: without it, Chromium finds no
+         usable recording device and a granted getUserMedia audio
+         request fails with NotReadableError (confirmed on
+         device). It is a normal (auto-granted)
+         permission. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+    <!-- Package visibility for ONE resolution (SEN-357): the
+         file picker pins itself to the system's own
+         ACTION_OPEN_DOCUMENT handler (SEC-170), which requires
+         resolving that intent. Without this declaration,
+         Android 11+ visibility filtering can hide the system
+         handler from the resolution. Nothing else is queried. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.OPEN_DOCUMENT" />
+            <!-- The resolved intent always carries a type
+                 (a specific MIME type or the any-type
+                 wildcard); the visibility match for a typed
+                 intent needs the data element to match it
+                 (SEN-363). -->
+            <data android:mimeType="*/*" />
+        </intent>
+    </queries>
+
+    <!-- appComponentFactory comes with the vendored ML Kit stack
+         (v0.41.0, libs/README.md): androidx.core 1.9.0's manifest
+         names CoreComponentFactory (the standard value in every
+         AGP build that carries androidx.core). extractNativeLibs
+         is false: the bundled .so files are stored uncompressed
+         and page-aligned, so the platform maps them from the APK
+         instead of extracting a second copy at install time. -->
+    <application
+        android:allowBackup="false"
+        android:appComponentFactory="androidx.core.app.CoreComponentFactory"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:enableOnBackInvokedCallback="true"
+        android:extractNativeLibs="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:theme="@style/AppTheme"
+        android:usesCleartextTraffic="true">
+
+        <!-- Vendored ML Kit / Play Services components, hand-merged
+             from the AAR manifests (no Gradle merger in this build;
+             libs/README.md records what was merged and what was
+             deliberately left out). -->
+        <meta-data
+            android:name="com.google.android.gms.version"
+            android:value="@integer/google_play_services_version" />
+
+        <provider
+            android:name="com.google.mlkit.common.internal.MlKitInitProvider"
+            android:authorities="jp.kaleidpixel.pageloupe.mlkitinitprovider"
+            android:exported="false"
+            android:initOrder="99" />
+
+        <service
+            android:name="com.google.mlkit.common.internal.MlKitComponentDiscoveryService"
+            android:directBootAware="true"
+            android:exported="false">
+            <meta-data
+                android:name="com.google.firebase.components:com.google.mlkit.common.internal.CommonComponentRegistrar"
+                android:value="com.google.firebase.components.ComponentRegistrar" />
+            <meta-data
+                android:name="com.google.firebase.components:com.google.mlkit.nl.translate.NaturalLanguageTranslateRegistrar"
+                android:value="com.google.firebase.components.ComponentRegistrar" />
+            <meta-data
+                android:name="com.google.firebase.components:com.google.mlkit.nl.languageid.internal.LanguageIdRegistrar"
+                android:value="com.google.firebase.components.ComponentRegistrar" />
+            <meta-data
+                android:name="com.google.firebase.components:com.google.mlkit.nl.languageid.bundled.internal.ThickLanguageIdRegistrar"
+                android:value="com.google.firebase.components.ComponentRegistrar" />
+        </service>
+
+        <activity
+            android:name="com.google.android.gms.common.api.GoogleApiActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- Deliberately NOT merged from the datatransport AARs:
+             TransportBackendDiscovery (and its CCT backend meta-data),
+             JobInfoSchedulerService and
+             AlarmManagerSchedulerBroadcastReceiver. Without backend
+             discovery and the scheduler components, ML Kit's
+             diagnostic events have no upload path and stay on the
+             device; the classes remain linked because ML Kit code
+             references them directly. See libs/README.md. -->
+
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|fontScale"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="http" />
+                <data android:scheme="https" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
