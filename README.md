@@ -56,7 +56,7 @@ https://dl.google.com/dl/android/maven2/com/android/tools/r8/8.7.18/r8-8.7.18.ja
 
 ### テスト
 
-JVM 単体テストがあります（Android SDK と Kotlin のほか、テスト専用 jar の取得も `fetch_libs.sh` が行います）。
+JVM 単体テストがあります。前提として、先に `app/fetch_libs.sh` を実行してください（テストが使うライブラリの派生 jar と、テスト専用 jar の取得も `fetch_libs.sh` が行います）。
 
 ```sh
 ./tests/run_tests.sh

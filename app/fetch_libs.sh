@@ -13,7 +13,6 @@
 # (build.sh re-verifies that identity on every build).
 set -e
 cd "$(dirname "$0")"
-APPDIR=$PWD
 GM=https://dl.google.com/dl/android/maven2
 MC=https://repo1.maven.org/maven2
 # Downloads land in a temp file INSIDE the target directory and
@@ -142,7 +141,7 @@ ensure_file ../tests/lib json-20260814.jar "$MC/org/json/json/20260814/json-2026
 check_coverage() {
   (cd "$1" && find . -maxdepth 1 ! -type d | sed 's|^\./||' | while read -r f; do
     case "$f" in SHA256SUMS|README.md) continue ;; esac
-    awk '{print $2}' SHA256SUMS | grep -qxF "$f" || { echo "$1/$f is not in SHA256SUMS" >&2; exit 1; }
+    awk '{print $2}' SHA256SUMS | grep -qxF -- "$f" || { echo "$1/$f is not in SHA256SUMS" >&2; exit 1; }
   done)
 }
 (cd libs && sha256sum -c SHA256SUMS)

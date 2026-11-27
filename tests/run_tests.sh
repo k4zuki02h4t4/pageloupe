@@ -31,6 +31,10 @@ cd "$(dirname "$0")/.."
 # the RecorderJson run line below uses, and its hash must
 # match. Any failure aborts the whole run.
 JSON_JAR=tests/lib/json-20260814.jar
+if [ ! -f "$JSON_JAR" ]; then
+  echo "run_tests: $JSON_JAR missing -- run app/fetch_libs.sh first" >&2
+  exit 1
+fi
 jar_dir=$(dirname "$JSON_JAR")
 jar_name=$(basename "$JSON_JAR")
 jar_ok=1
@@ -38,12 +42,19 @@ jar_ok=1
 awk -v n="$jar_name" 'NF != 2 || $2 != n { bad = 1 } END { exit bad }' "$jar_dir/SHA256SUMS" || jar_ok=0
 [ "$(awk '{ print $1 }' "$jar_dir/SHA256SUMS")" = "$(sha256sum "$JSON_JAR" | awk '{ print $1 }')" ] || jar_ok=0
 if [ "$jar_ok" -ne 1 ]; then
-  echo "tests/lib: jar verification failed - see tests/lib/README.md" >&2
+  echo "tests/lib: jar verification failed - run app/fetch_libs.sh, see tests/lib/README.md" >&2
   exit 1
 fi
 # Toolchain resolution and checks are shared with
 # app/build.sh via app/toolchain-env.sh.
-. "$(dirname "$0")/../app/toolchain-env.sh"
+. app/toolchain-env.sh
+# The test compile classpath includes library classes that
+# app/fetch_libs.sh derives; fail early with the remedy
+# instead of a kotlinc error pages later.
+if [ ! -f app/libs/webkit-classes.jar ]; then
+  echo "run_tests: app/libs/webkit-classes.jar missing -- run app/fetch_libs.sh first" >&2
+  exit 1
+fi
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 "$KOTLINC" -cp "$AJAR:app/libs/webkit-classes.jar" -include-runtime -d "$OUT/tests.jar" \

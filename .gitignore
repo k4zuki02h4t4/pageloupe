@@ -1,9 +1,7 @@
 app/build/
 # Fetched dependency binaries (app/fetch_libs.sh downloads and
-# hash-verifies them; they are not source). In this working
-# repository the files are tracked from before this rule, so
-# the entries are inert here; in the public repository they
-# keep fetched binaries out of version control.
+# hash-verifies them; they are not source, so they are never
+# tracked).
 app/libs/*.aar
 app/libs/*.jar
 app/libs/*.pom

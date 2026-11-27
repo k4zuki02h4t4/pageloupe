@@ -14,6 +14,16 @@
 # Required versions are listed in the top-level README.md.
 # On any problem this file prints which variable to set and
 # fails the sourcing script.
+#
+# Contract for the sourcing script: this file provides the
+# variables TOOLS, JAVA_HOME (exported, and prepended to
+# PATH), SDK, KOTLINC_HOME, KOTLINC, STDLIB and AJAR, and the
+# functions need_exec / need_file with the toolchain_missing
+# flag. Everything else it uses internally is unset before
+# it returns.
+if [ -n "${KOTLIN_HOME:-}" ] && [ -z "${KOTLINC_HOME:-}" ]; then
+  echo "toolchain: KOTLIN_HOME is set but ignored (this build reads KOTLINC_HOME)" >&2
+fi
 TOOLS=${PAGELOUPE_TOOLS:-$HOME/workspace/tools}
 if [ -n "${PAGELOUPE_TOOLS:-}" ]; then
   DEF_JDK=$TOOLS/jdk
@@ -44,3 +54,4 @@ if [ "$JAVA_MAJOR" != "17" ]; then
   echo "toolchain: JDK 17 is required (JAVA_HOME=$JAVA_HOME)" >&2
   return 1 2>/dev/null || exit 1
 fi
+unset DEF_JDK DEF_SDK JAVA_MAJOR
