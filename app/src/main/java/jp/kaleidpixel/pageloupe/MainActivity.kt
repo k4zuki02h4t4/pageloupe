@@ -6482,7 +6482,7 @@ class MainActivity : Activity(), BrowserTab.Listener, PageTranslator.Host {
     // not removal of the feature).
     private fun showAbout() {
         // The version comes from the package, never a second
-        // hard-coded copy that can drift from build.sh.
+        // hard-coded copy that can drift from the build files.
         val version = try {
             packageManager.getPackageInfo(packageName, 0).versionName ?: ""
         } catch (_: Exception) {

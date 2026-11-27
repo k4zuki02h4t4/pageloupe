@@ -1,15 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="jp.kaleidpixel.pageloupe">
+    xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- androidx.core 1.9.0 (vendored for ML Kit, see libs/README.md)
-         declares this signature permission for its receiver
-         registration compat path. The name is the library's
-         ${applicationId} placeholder resolved to this package. -->
-    <permission
-        android:name="jp.kaleidpixel.pageloupe.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
-        android:protectionLevel="signature" />
-    <uses-permission android:name="jp.kaleidpixel.pageloupe.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" />
+    <!-- Library manifest contributions are merged by AGP from the
+         AARs (docs/dependencies.md): androidx.core supplies the
+         DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION signature
+         permission pair and the appComponentFactory,
+         play-services-basement the gms.version meta-data,
+         play-services-base GoogleApiActivity, and the ML Kit AARs
+         MlKitInitProvider plus MlKitComponentDiscoveryService with
+         their four component registrars. What the merger must
+         never bring in is removed explicitly below. -->
 
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- No app code uses this directly, but Chromium's WebView
@@ -51,16 +52,12 @@
         </intent>
     </queries>
 
-    <!-- appComponentFactory comes with the vendored ML Kit stack
-         (v0.41.0, libs/README.md): androidx.core 1.9.0's manifest
-         names CoreComponentFactory (the standard value in every
-         AGP build that carries androidx.core). extractNativeLibs
-         is false: the bundled .so files are stored uncompressed
-         and page-aligned, so the platform maps them from the APK
-         instead of extracting a second copy at install time. -->
+    <!-- extractNativeLibs is false: the bundled .so files are
+         stored uncompressed and page-aligned, so the platform
+         maps them from the APK instead of extracting a second
+         copy at install time. -->
     <application
         android:allowBackup="false"
-        android:appComponentFactory="androidx.core.app.CoreComponentFactory"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:enableOnBackInvokedCallback="true"
         android:extractNativeLibs="false"
@@ -70,51 +67,26 @@
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="true">
 
-        <!-- Vendored ML Kit / Play Services components, hand-merged
-             from the AAR manifests (no Gradle merger in this build;
-             libs/README.md records what was merged and what was
-             deliberately left out). -->
-        <meta-data
-            android:name="com.google.android.gms.version"
-            android:value="@integer/google_play_services_version" />
-
-        <provider
-            android:name="com.google.mlkit.common.internal.MlKitInitProvider"
-            android:authorities="jp.kaleidpixel.pageloupe.mlkitinitprovider"
-            android:exported="false"
-            android:initOrder="99" />
-
-        <service
-            android:name="com.google.mlkit.common.internal.MlKitComponentDiscoveryService"
-            android:directBootAware="true"
-            android:exported="false">
-            <meta-data
-                android:name="com.google.firebase.components:com.google.mlkit.common.internal.CommonComponentRegistrar"
-                android:value="com.google.firebase.components.ComponentRegistrar" />
-            <meta-data
-                android:name="com.google.firebase.components:com.google.mlkit.nl.translate.NaturalLanguageTranslateRegistrar"
-                android:value="com.google.firebase.components.ComponentRegistrar" />
-            <meta-data
-                android:name="com.google.firebase.components:com.google.mlkit.nl.languageid.internal.LanguageIdRegistrar"
-                android:value="com.google.firebase.components.ComponentRegistrar" />
-            <meta-data
-                android:name="com.google.firebase.components:com.google.mlkit.nl.languageid.bundled.internal.ThickLanguageIdRegistrar"
-                android:value="com.google.firebase.components.ComponentRegistrar" />
-        </service>
-
-        <activity
-            android:name="com.google.android.gms.common.api.GoogleApiActivity"
-            android:exported="false"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
-
         <!-- Deliberately NOT merged from the datatransport AARs:
-             TransportBackendDiscovery (and its CCT backend meta-data),
-             JobInfoSchedulerService and
-             AlarmManagerSchedulerBroadcastReceiver. Without backend
-             discovery and the scheduler components, ML Kit's
-             diagnostic events have no upload path and stay on the
-             device; the classes remain linked because ML Kit code
-             references them directly. See libs/README.md. -->
+             TransportBackendDiscovery (and its CCT backend
+             meta-data), JobInfoSchedulerService and
+             AlarmManagerSchedulerBroadcastReceiver. Without
+             backend discovery and the scheduler components,
+             ML Kit's diagnostic events have no upload path and
+             stay on the device; the classes remain linked
+             because ML Kit code references them directly.
+             See docs/dependencies.md. The shipped component set
+             as a whole is pinned by app/manifest-components.txt
+             and asserted after every build. -->
+        <service
+            android:name="com.google.android.datatransport.runtime.scheduling.jobscheduling.JobInfoSchedulerService"
+            tools:node="remove" />
+        <receiver
+            android:name="com.google.android.datatransport.runtime.scheduling.jobscheduling.AlarmManagerSchedulerBroadcastReceiver"
+            tools:node="remove" />
+        <service
+            android:name="com.google.android.datatransport.runtime.backends.TransportBackendDiscovery"
+            tools:node="remove" />
 
         <activity
             android:name=".MainActivity"

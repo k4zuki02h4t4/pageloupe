@@ -1,11 +1,16 @@
 app/build/
-# Fetched dependency binaries (app/fetch_libs.sh downloads and
-# hash-verifies them; they are not source, so they are never
-# tracked).
-app/libs/*.aar
-app/libs/*.jar
-app/libs/*.pom
-tests/lib/*.jar
+# Gradle's project state, the Kotlin daemon's session files,
+# and the machine-local SDK pointer.
+.gradle/
+.kotlin/
+build/
+local.properties
+# Signing keys, under any name. The debug key (read by the
+# signing config in app/build.gradle.kts) is never committed:
+# whoever holds it can sign a modified build that installs over
+# the real one.
+*.keystore
+*.jks
 __pycache__/
 *.apk
 *.apk.idsig

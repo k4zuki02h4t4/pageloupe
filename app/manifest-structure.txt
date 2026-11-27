@@ -1,0 +1,70 @@
+# The structural inventory of the shipped APK's merged
+# manifest, asserted exactly by app/verify_manifest.py (see
+# app/manifest-components.txt for the discipline). Sections:
+# the set of element tags that may appear at all, the
+# application element's attribute names, every <meta-data>
+# entry (as "name @ parent", where parent is "application"
+# or the owning component's name; an entry may carry =<value>
+# to pin its value as well — the component registrars do,
+# gms.version does not, because its value is a resource
+# reference whose id shifts between builds), every intent
+# surface (one line per <intent-filter>, and per <intent>
+# inside <queries>: the owner, then its action, category and
+# data-scheme names), the application id itself, the
+# <manifest> element's own attribute names (section
+# manifest-attributes), and the <uses-sdk> values as
+# name=value lines (section uses-sdk). A
+# library update that adds an element kind, an application
+# attribute (a networkSecurityConfig, a custom Application
+# class), a meta-data entry, or a new intent surface fails
+# the build until this file is updated in the same commit.
+# section: tags
+action
+activity
+application
+category
+data
+intent
+intent-filter
+manifest
+meta-data
+permission
+provider
+queries
+service
+uses-permission
+uses-sdk
+# section: application-attributes
+allowBackup
+appComponentFactory
+dataExtractionRules
+enableOnBackInvokedCallback
+extractNativeLibs
+icon
+label
+roundIcon
+theme
+usesCleartextTraffic
+# section: meta-data
+com.google.android.gms.version @ application
+com.google.firebase.components:com.google.mlkit.common.internal.CommonComponentRegistrar @ com.google.mlkit.common.internal.MlKitComponentDiscoveryService=com.google.firebase.components.ComponentRegistrar
+com.google.firebase.components:com.google.mlkit.nl.languageid.bundled.internal.ThickLanguageIdRegistrar @ com.google.mlkit.common.internal.MlKitComponentDiscoveryService=com.google.firebase.components.ComponentRegistrar
+com.google.firebase.components:com.google.mlkit.nl.languageid.internal.LanguageIdRegistrar @ com.google.mlkit.common.internal.MlKitComponentDiscoveryService=com.google.firebase.components.ComponentRegistrar
+com.google.firebase.components:com.google.mlkit.nl.translate.NaturalLanguageTranslateRegistrar @ com.google.mlkit.common.internal.MlKitComponentDiscoveryService=com.google.firebase.components.ComponentRegistrar
+# section: intent-filters
+<queries> | actions=android.intent.action.OPEN_DOCUMENT | categories= | schemes=
+jp.kaleidpixel.pageloupe.MainActivity | actions=android.intent.action.MAIN | categories=android.intent.category.LAUNCHER | schemes=
+jp.kaleidpixel.pageloupe.MainActivity | actions=android.intent.action.VIEW | categories=android.intent.category.BROWSABLE,android.intent.category.DEFAULT | schemes=http,https
+# section: application-id
+jp.kaleidpixel.pageloupe
+# section: manifest-attributes
+compileSdkVersion
+compileSdkVersionCodename
+package
+platformBuildVersionCode
+platformBuildVersionName
+versionCode
+versionName
+# section: uses-sdk
+minSdkVersion=33
+targetSdkVersion=34

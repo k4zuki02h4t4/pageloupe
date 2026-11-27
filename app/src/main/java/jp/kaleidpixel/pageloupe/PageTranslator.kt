@@ -184,6 +184,20 @@ class PageTranslator(
      * the run settles. */
     private val translators = LinkedHashMap<String, Translator>()
 
+    /** SEN-1101 gate bookkeeping: the gate token the live
+     * run's translateAll issued under; the clients holding
+     * an unsettled claim (at most one in practice -- the
+     * gate allows a single claim process-wide); and the
+     * subset of those whose close closeClients deferred
+     * to the claim's settlement, so the claimed Task
+     * settles with its load's real completion instead of
+     * an early cancellation. Both sets are keyed by the
+     * client itself, so a later run's claim can never be
+     * mistaken for an earlier one's. */
+    private var gateToken: Any? = null
+    private val gateOutstandingClients = HashSet<Translator>()
+    private val gateDeferredClients = HashSet<Translator>()
+
     /** The page-side state key of the live document, and the
      * origin it was extracted from. Both die with the run's
      * document; the apply/restore wrappers re-check them. */
@@ -703,6 +717,23 @@ class PageTranslator(
         var inFlight = 0
         var finished = 0
         var failedCount = 0
+        // SEN-1101: until FirstLoadGate proves the
+        // translate library's native initialization, this
+        // pump issues under the gate's discipline (one
+        // first load in flight in the whole process). The
+        // claim is released from a completion listener
+        // rather than the success/failure pair because a
+        // cancelled Task settles through neither of the
+        // pair but does settle -- and the claiming client
+        // is kept open past the run's end (closeClients
+        // defers to settleGate) so that its Task can only
+        // settle when the load itself has finished: a
+        // cancellation would settle the Task immediately
+        // while the load keeps running on ML Kit's thread
+        // pool, which is exactly the overlap the gate
+        // exists to prevent.
+        val gateToken = Any()
+        this.gateToken = gateToken
 
         // One settlement path for both outcomes: progress is
         // progress, so every settlement re-arms the watchdog
@@ -728,11 +759,107 @@ class PageTranslator(
                 pump()
             }
         }
+        // Releases this run's gate claim when the claimed
+        // item's Task settles: closes the claimed client
+        // first when closeClients deferred that close to
+        // here, then wakes the runs waiting on the claim
+        // (oldest first) and resumes this run's own pump;
+        // whichever of the item's listeners runs first,
+        // the other finds the gate already settled and the
+        // two paths converge.
+        fun settleGate(succeeded: Boolean, claimedClient: Translator) {
+            gateOutstandingClients.remove(claimedClient)
+            // The gate settles before the deferred close:
+            // the settlement must not depend on close()
+            // succeeding. Nothing runs between the two on
+            // this thread, and the waiters only act when
+            // their resumes run below, after the close.
+            val resumes = firstLoadGate.settle(gateToken, succeeded)
+            DebugLog.log(
+                "translate",
+                "first-load gate settled ok=$succeeded proven=${firstLoadGate.isProven}"
+            )
+            if (gateDeferredClients.remove(claimedClient)) {
+                // A close failure must not strand the
+                // resumes extracted above: the gate is
+                // already settled, and the waiting runs
+                // proceed either way.
+                try {
+                    claimedClient.close()
+                } catch (e: RuntimeException) {
+                    DebugLog.log("translate", "first-load gate close failed")
+                }
+            }
+            for (resume in resumes) {
+                resume()
+            }
+            pump()
+        }
         pump = {
             while (gen == generation && inFlight < MAX_IN_FLIGHT && next < work.items.size) {
+                var wantClaim = false
+                when (firstLoadGate.decision(gateToken)) {
+                    FirstLoadGate.Decision.FREE -> Unit
+                    FirstLoadGate.Decision.HELD -> {
+                        // This run's claimed item is still
+                        // out; its settlement resumes the
+                        // pump through settleGate.
+                        break
+                    }
+                    FirstLoadGate.Decision.WAIT -> {
+                        // A previous run's first load is
+                        // still out: its run may already be
+                        // over, but the load itself cannot
+                        // be stopped, so this run waits for
+                        // the settlement. The watchdog
+                        // bounds the wait like any other
+                        // stall.
+                        DebugLog.log("translate", "first-load gate wait")
+                        firstLoadGate.waitForRelease(gateToken) { pump() }
+                        break
+                    }
+                    FirstLoadGate.Decision.CLAIM -> wantClaim = true
+                }
                 val pos = next++
                 inFlight++
-                clients[pos].translate(work.items[pos].split.core)
+                // The claim is taken only once the Task
+                // exists, and the completion listener is
+                // registered before the pair, so no
+                // synchronous failure in between can leak
+                // the claim: an exception before the claim
+                // leaves the gate untouched, and one after
+                // it still settles through the listener (a
+                // registration failure keeps the claim held
+                // instead -- see the catch below).
+                val task = clients[pos].translate(work.items[pos].split.core)
+                if (wantClaim) {
+                    val claimedClient = clients[pos]
+                    gateOutstandingClients.add(claimedClient)
+                    firstLoadGate.claim(gateToken)
+                    DebugLog.log("translate", "first-load gate claimed")
+                    try {
+                        task.addOnCompleteListener { settled ->
+                            settleGate(settled.isSuccessful, claimedClient)
+                        }
+                    } catch (e: RuntimeException) {
+                        // Fail closed: the load is already
+                        // submitted and may still be running,
+                        // so the claim is NOT released here
+                        // (releasing it would reopen the
+                        // overlap). The claim then stays held
+                        // for the process's life: this run and
+                        // every later one wait on the gate and
+                        // fail by their watchdogs, and only a
+                        // restart clears it -- the accepted
+                        // cost, recorded with SEN-1101, of
+                        // never reopening the overlap.
+                        // Listener registration is not a path
+                        // the Tasks runtime is known to fail.
+                        DebugLog.log("translate", "first-load gate listener failed")
+                        throw e
+                    }
+                }
+                task
                     .addOnSuccessListener { text ->
                         if (gen != generation) return@addOnSuccessListener
                         results[pos] = text
@@ -887,6 +1014,11 @@ class PageTranslator(
     private fun settle(translated: Boolean, pageState: PageStateAction, dismiss: Boolean) {
         generation++
         disarmWatchdog()
+        // A run that ends while waiting on the gate drops
+        // its registration; a run holding the claim keeps
+        // it (its settlement is the waiters' release).
+        gateToken?.let { firstLoadGate.cancelWait(it) }
+        gateToken = null
         closeClients()
         when (pageState) {
             PageStateAction.DELETE_SCRIPT ->
@@ -995,7 +1127,17 @@ class PageTranslator(
 
     private fun closeClients() {
         closeIdentifier()
-        for (tr in translators.values) tr.close()
+        for (tr in translators.values) {
+            if (tr in gateOutstandingClients) {
+                // SEN-1101: closing this client now would
+                // cancel the claimed Task while its load
+                // may still be running; settleGate closes
+                // it when the claim settles instead.
+                gateDeferredClients.add(tr)
+            } else {
+                tr.close()
+            }
+        }
         translators.clear()
     }
 
@@ -1090,6 +1232,10 @@ class PageTranslator(
          * keep the on-device engine busy without flooding it
          * with a large page's worth of tasks at once. */
         private const val MAX_IN_FLIGHT = 8
+
+        // SEN-1101: the first-load gate shared by every
+        // run in the process (see FirstLoadGate).
+        private val firstLoadGate = FirstLoadGate()
 
         /** The watchdog's stall bound for the phases that
          * report progress or are quick by construction

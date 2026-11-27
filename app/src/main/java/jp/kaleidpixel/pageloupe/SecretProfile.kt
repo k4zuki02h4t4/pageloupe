@@ -34,10 +34,10 @@ import androidx.webkit.WebViewCompat
  * backstop).
  *
  * androidx.webkit and the androidx.core it pulls in are this
- * app's only runtime library dependencies; everything kept
- * in app/libs — those two and the compile-only annotation
+ * app's only runtime library dependencies; the whole
+ * dependency set — those two and the compile-only annotation
  * jars alike — is listed with provenance and hashes in
- * app/libs/README.md.
+ * docs/dependencies.md.
  */
 object SecretProfile {
 
